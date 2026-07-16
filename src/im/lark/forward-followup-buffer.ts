@@ -32,8 +32,8 @@ export class ForwardFollowupBuffer<T> {
     return this.pending.size;
   }
 
-  hold(seed: ForwardFollowupSeed<T>): boolean {
-    if (this.waitMs <= 0) return false;
+  hold(seed: ForwardFollowupSeed<T>, waitMs = this.waitMs): boolean {
+    if (waitMs <= 0) return false;
     if (this.pending.has(seed.messageId)) return true;
 
     const timer = setTimeout(() => {
@@ -41,7 +41,7 @@ export class ForwardFollowupBuffer<T> {
       if (!entry) return;
       this.pending.delete(seed.messageId);
       void Promise.resolve(entry.seed.flush(entry.seed.payload)).catch(this.onFlushError);
-    }, this.waitMs);
+    }, waitMs);
     this.pending.set(seed.messageId, { seed, timer });
     return true;
   }

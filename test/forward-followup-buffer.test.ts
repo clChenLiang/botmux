@@ -81,4 +81,22 @@ describe('ForwardFollowupBuffer', () => {
     })).toBe(false);
     expect(buffer.size).toBe(0);
   });
+
+  it('accepts a remaining wait override when restoring persisted seeds', async () => {
+    const flush = vi.fn().mockResolvedValue(undefined);
+    const buffer = new ForwardFollowupBuffer<string>(1_500);
+    buffer.hold({
+      larkAppId: 'app-1',
+      chatId: 'chat-1',
+      senderOpenId: 'user-1',
+      messageId: 'seed-restored',
+      payload: 'restored',
+      flush,
+    }, 25);
+
+    await vi.advanceTimersByTimeAsync(24);
+    expect(flush).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(flush).toHaveBeenCalledOnce();
+  });
 });

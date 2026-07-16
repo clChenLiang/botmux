@@ -44,7 +44,8 @@ import { openPending, isThrottled, clearPending } from './grant-pending.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { chatQuotaKey, globalQuotaKey } from '../../services/grant-store.js';
 import { ForwardFollowupBuffer } from './forward-followup-buffer.js';
-import { claimMessageOnce, releaseMessageClaim, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
+import { listForwardFollowups, putForwardFollowup, removeForwardFollowup } from './forward-followup-store.js';
+import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
 import { resolveRegularGroupMode, resolveGroupMentionMode } from '../../services/chat-reply-mode-store.js';
 import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
@@ -1958,12 +1959,44 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     err => logger.error(`Error flushing delayed topic seed: ${err}`),
   );
   const dispatchHumanMessage = async (payload: PendingForwardTopicPayload): Promise<void> => {
-    const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
-    await serializeByAnchor(payload.ctx.anchor, () => ownsSession
-      ? handlers.handleThreadReply(payload.data, payload.ctx)
-      : handlers.handleNewTopic(payload.data, payload.ctx))
-      .catch(err => logger.error(`Error handling message event: ${err}`));
+    await serializeByAnchor(payload.ctx.anchor, () => {
+      const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
+      return ownsSession
+        ? handlers.handleThreadReply(payload.data, payload.ctx)
+        : handlers.handleNewTopic(payload.data, payload.ctx);
+    });
   };
+  const dispatchPersistedForwardFollowup = async (
+    seedMessageId: string,
+    payload: PendingForwardTopicPayload,
+  ): Promise<void> => {
+    await dispatchHumanMessage(payload);
+    removeForwardFollowup(larkAppId, seedMessageId);
+  };
+  for (const record of listForwardFollowups<PendingForwardTopicPayload>(larkAppId)) {
+    const senderOpenId = record.payload?.data?.sender?.sender_id?.open_id as string | undefined;
+    const chatId = record.payload?.ctx?.chatId;
+    if (!senderOpenId || !chatId || !record.payload?.ctx?.anchor) {
+      removeForwardFollowup(larkAppId, record.messageId);
+      continue;
+    }
+    const flush = (payload: PendingForwardTopicPayload) =>
+      dispatchPersistedForwardFollowup(record.messageId, payload);
+    const remainingMs = record.dueAt - Date.now();
+    const isUnpairedSeed = !record.payload.ctx.forwardSeedData;
+    if (isUnpairedSeed && remainingMs > 0 && forwardFollowups.hold({
+      larkAppId,
+      chatId,
+      senderOpenId,
+      messageId: record.messageId,
+      payload: record.payload,
+      flush,
+    }, remainingMs)) {
+      logger.info(`[forward-followup] restored pending seed=${record.messageId.substring(0, 12)} remaining=${remainingMs}ms`);
+    } else {
+      void flush(record.payload).catch(err => logger.error(`Error restoring delayed topic seed: ${err}`));
+    }
+  }
   const seedRoutingGates = new Map<string, { ready: Promise<void>; complete: () => void }>();
   const registerSeedRoutingGate = (messageId: string) => {
     let resolveReady!: () => void;
@@ -2477,9 +2510,6 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           });
         }
         if (pairedForwardSeed) {
-          // The seed claim was released while it existed only in memory. Mark
-          // it durable again immediately before the paired dispatch.
-          claimMessageOnce(larkAppId, pairedForwardSeed.messageId);
           // The clarification becomes the visible Lark topic root. The earlier
           // forwarded seed is retained only as prompt context, so the bot never
           // emits a reply under the forwarding bubble itself.
@@ -2488,6 +2518,29 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           routingSource = 'topic-chat';
           replyRootId = undefined;
           ownsSession = false;
+          try {
+            putForwardFollowup(larkAppId, {
+              messageId: pairedForwardSeed.messageId,
+              dueAt: Date.now(),
+              payload: {
+                data,
+                ctx: {
+                  ...pairedForwardSeed.payload.ctx,
+                  chatId,
+                  messageId,
+                  chatType,
+                  larkAppId,
+                  scope: 'thread',
+                  anchor: messageId,
+                  replyRootId: undefined,
+                  forwardSeedData: pairedForwardSeed.payload.data,
+                },
+                ownsSession: false,
+              },
+            });
+          } catch (err) {
+            logger.warn(`[forward-followup] failed to persist provisional paired payload: ${err}`);
+          }
           logger.info(
             `[forward-followup] merged seed=${pairedForwardSeed.messageId.substring(0, 12)} ` +
             `into msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
@@ -2624,25 +2677,45 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           && ctx.scope === 'thread'
           && ctx.anchor === messageId
           && !ownsSession;
-        if (shouldDelayTopicSeed && forwardFollowups.hold({
-          larkAppId,
-          chatId,
-          senderOpenId,
-          messageId,
-          payload,
-          flush: async delayedPayload => {
-            claimMessageOnce(larkAppId, messageId);
-            await dispatchHumanMessage(delayedPayload);
-          },
-        })) {
-          // A process crash during the grace period must not lose this message:
-          // relinquish the persistent dedupe claim so Lark redelivery can
-          // recover it. Timeout/match paths claim it again before dispatch.
-          releaseMessageClaim(larkAppId, messageId);
-          logger.debug(
-            `[forward-followup] holding topic seed msg=${messageId.substring(0, 12)} ` +
-            `for ${config.daemon.forwardFollowupWaitMs}ms`,
-          );
+        if (shouldDelayTopicSeed) {
+          try {
+            putForwardFollowup(larkAppId, {
+              messageId,
+              dueAt: Date.now() + config.daemon.forwardFollowupWaitMs,
+              payload,
+            });
+            if (forwardFollowups.hold({
+              larkAppId,
+              chatId,
+              senderOpenId,
+              messageId,
+              payload,
+              flush: delayedPayload => dispatchPersistedForwardFollowup(messageId, delayedPayload),
+            })) {
+              logger.debug(
+                `[forward-followup] holding topic seed msg=${messageId.substring(0, 12)} ` +
+                `for ${config.daemon.forwardFollowupWaitMs}ms`,
+              );
+              return;
+            }
+            removeForwardFollowup(larkAppId, messageId);
+          } catch (err) {
+            logger.warn(`[forward-followup] persistence unavailable, dispatching immediately: ${err}`);
+          }
+        }
+
+        if (pairedForwardSeed) {
+          try {
+            putForwardFollowup(larkAppId, {
+              messageId: pairedForwardSeed.messageId,
+              dueAt: Date.now(),
+              payload,
+            });
+          } catch (err) {
+            logger.warn(`[forward-followup] failed to persist paired payload before dispatch: ${err}`);
+          }
+          await dispatchPersistedForwardFollowup(pairedForwardSeed.messageId, payload)
+            .catch(err => logger.error(`Error handling paired message event: ${err}`));
           return;
         }
 
@@ -2650,7 +2723,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // processed in arrival order — never concurrently. Without this a fast
         // second message interleaves with the first's async session-spawn and is
         // dropped (worker-not-ready → re-fork branch). See anchor-serializer.ts.
-        await dispatchHumanMessage(payload);
+        await dispatchHumanMessage(payload)
+          .catch(err => logger.error(`Error handling message event: ${err}`));
       } catch (err) {
         logger.error(`Error handling message event: ${err}`);
       } finally {

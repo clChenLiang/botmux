@@ -11,7 +11,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { claimMessageOnce, releaseMessageClaim, _resetCacheForTest } from '../src/services/seen-message-store.js';
+import { claimMessageOnce, _resetCacheForTest } from '../src/services/seen-message-store.js';
 
 const APP = 'app-test';
 const HOUR = 60 * 60_000;
@@ -54,13 +54,6 @@ describe('seen-message-store', () => {
     expect(claimMessageOnce(APP, 'om_persist')).toBe(true);
     _resetCacheForTest(); // 模拟 daemon 重启 / 崩溃循环：内存表清空，但盘上还在
     expect(claimMessageOnce(APP, 'om_persist')).toBe(false);
-  });
-
-  it('releases a delayed claim so a restart can accept redelivery', () => {
-    expect(claimMessageOnce(APP, 'om_delayed')).toBe(true);
-    releaseMessageClaim(APP, 'om_delayed');
-    _resetCacheForTest();
-    expect(claimMessageOnce(APP, 'om_delayed')).toBe(true);
   });
 
   it('CORE: suppresses the 6h re-push tier (beyond the old 2h TTL)', () => {

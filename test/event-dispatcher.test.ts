@@ -150,6 +150,7 @@ const USER_OPEN_ID = 'ou_user_123';
 
 beforeEach(() => {
   config.daemon.forwardFollowupWaitMs = 0;
+  mockReadFileSync.mockReset().mockReturnValue('[]');
   mockListChatMessages.mockReset().mockResolvedValue([]);
   mockListChatMessagesUntil.mockReset().mockResolvedValue([]);
   mockListThreadMessages.mockReset().mockResolvedValue([]);
@@ -289,6 +290,53 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
     }));
   });
 
+  it('rechecks ownership only after earlier same-anchor work leaves the serializer', async () => {
+    let ownsSeed = false;
+    let releaseControl!: () => void;
+    const controlBlocked = new Promise<void>(resolve => { releaseControl = resolve; });
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA queued seed' }),
+      messageId: 'msg-serializer-seed',
+      chatId: 'chat-serializer-owner',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    const control = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA /summary' }),
+      rootId: 'msg-serializer-seed',
+      messageId: 'msg-serializer-control',
+      chatId: 'chat-serializer-owner',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.isSessionOwner.mockImplementation(anchor => anchor === 'msg-serializer-seed' && ownsSeed);
+    handlers.handleNewTopic.mockImplementation(async data => {
+      if (data === control) {
+        await controlBlocked;
+        ownsSeed = true;
+      }
+    });
+
+    capturedHandlers['im.message.receive_v1'](seed);
+    await flushEventWork();
+    capturedHandlers['im.message.receive_v1'](control);
+    await flushEventWork();
+    await new Promise(resolve => setTimeout(resolve, 30));
+
+    releaseControl();
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(control, expect.objectContaining({
+      anchor: 'msg-serializer-seed',
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalledWith(seed, expect.anything());
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(seed, expect.objectContaining({
+      anchor: 'msg-serializer-seed',
+    }));
+  });
+
   it('does not delay an ordinary-group message', async () => {
     mockGetChatMode.mockResolvedValue('group');
     const event = makeUserMessageEvent({
@@ -399,6 +447,46 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
 
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
       anchor: 'msg-wait-disabled',
+    }));
+  });
+
+  it('restores a persisted pending seed after dispatcher restart', async () => {
+    const restoredData = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA restored forward' }),
+      messageId: 'msg-restored-seed',
+      chatId: 'chat-restored-seed',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    const restoredPayload = {
+      data: restoredData,
+      ctx: {
+        chatId: 'chat-restored-seed',
+        messageId: 'msg-restored-seed',
+        chatType: 'group',
+        scope: 'thread',
+        anchor: 'msg-restored-seed',
+        larkAppId: MY_APP_ID,
+      },
+      ownsSession: false,
+    };
+    mockReadFileSync.mockImplementation(path => String(path).includes('forward-followups-')
+      ? JSON.stringify([{
+          messageId: 'msg-restored-seed',
+          dueAt: Date.now() + 20,
+          payload: restoredPayload,
+        }])
+      : '[]');
+    handlers.handleNewTopic.mockClear();
+    capturedHandlers = {};
+
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    await new Promise(resolve => setTimeout(resolve, 30));
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(restoredData, expect.objectContaining({
+      anchor: 'msg-restored-seed',
     }));
   });
 });
