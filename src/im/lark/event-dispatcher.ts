@@ -47,7 +47,7 @@ import { ForwardFollowupBuffer } from './forward-followup-buffer.js';
 import { listForwardFollowups, putForwardFollowup, removeForwardFollowup } from './forward-followup-store.js';
 import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
-import { resolveRegularGroupMode, resolveGroupMentionMode } from '../../services/chat-reply-mode-store.js';
+import { resolveRegularGroupMode, resolveGroupMentionMode, type GroupMentionMode } from '../../services/chat-reply-mode-store.js';
 import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
 import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
 import { isSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
@@ -1415,6 +1415,10 @@ interface PendingForwardTopicPayload {
   ownsSession: boolean;
 }
 
+function usesForwardFollowupDelay(mentionMode: GroupMentionMode): boolean {
+  return mentionMode === 'never' || mentionMode === 'ambient';
+}
+
 export interface EventHandlers {
   handleCardAction: (data: any, larkAppId: string) => Promise<any>;
   handleNewTopic: (data: any, ctx: RoutingContext) => Promise<void>;
@@ -1984,7 +1988,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       dispatchPersistedForwardFollowup(record.messageId, payload);
     const remainingMs = record.dueAt - Date.now();
     const isUnpairedSeed = !record.payload.ctx.forwardSeedData;
-    if (isUnpairedSeed && remainingMs > 0 && forwardFollowups.hold({
+    const delayStillEnabled = usesForwardFollowupDelay(resolveGroupMentionMode(larkAppId));
+    if (isUnpairedSeed && delayStillEnabled && remainingMs > 0 && forwardFollowups.hold({
       larkAppId,
       chatId,
       senderOpenId,
@@ -2502,12 +2507,32 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         let pairedForwardSeed;
         if (senderOpenId && message.root_id && !isControlCommand) {
           await seedRoutingGates.get(message.root_id)?.ready;
-          pairedForwardSeed = forwardFollowups.take({
+          const pairingInput = {
             larkAppId,
             chatId,
             senderOpenId,
             rootId: message.root_id,
-          });
+          };
+          const pairingMentionMode = resolveGroupMentionMode(larkAppId);
+          const ambientRedirect = pairingMentionMode === 'ambient'
+            && !explicitlyMentionedThisBot
+            && mentionsAnotherMember(larkAppId, message);
+          const pairingDelayEnabled = usesForwardFollowupDelay(pairingMentionMode);
+          if (pairingDelayEnabled && !ambientRedirect) {
+            pairedForwardSeed = forwardFollowups.take(pairingInput);
+          } else if (!pairingDelayEnabled) {
+            const stalePendingSeed = forwardFollowups.take(pairingInput);
+            if (stalePendingSeed) {
+              try {
+                await dispatchPersistedForwardFollowup(stalePendingSeed.messageId, stalePendingSeed.payload);
+              } catch (err) {
+                logger.warn(
+                  `[forward-followup] failed to flush stale seed=${stalePendingSeed.messageId.substring(0, 12)}; ` +
+                  `continuing current msg=${messageId.substring(0, 12)}: ${err}`,
+                );
+              }
+            }
+          }
         }
         if (pairedForwardSeed) {
           // The clarification becomes the visible Lark topic root. The earlier
@@ -2670,7 +2695,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? ownsSession;
         }
         const payload = { data, ctx, ownsSession } satisfies PendingForwardTopicPayload;
-        const shouldDelayTopicSeed = !pairedForwardSeed
+        const groupMentionMode = resolveGroupMentionMode(larkAppId);
+        const shouldDelayTopicSeed = usesForwardFollowupDelay(groupMentionMode)
+          && !pairedForwardSeed
           && !isControlCommand
           && !!senderOpenId
           && routingSource === 'topic-chat'

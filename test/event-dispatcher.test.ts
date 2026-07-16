@@ -166,7 +166,10 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
     __resetAnchorQueues();
     __resetEventClaimsForTest();
     _resetGrantPending();
-    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupMentionMode: 'never',
+    });
     handlers = makeHandlers();
     mockFindOncallChat.mockReturnValue(undefined);
     mockGetChatMode.mockResolvedValue('topic');
@@ -359,6 +362,176 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
     }));
   });
 
+  it.each(['never', 'ambient'] as const)(
+    'delays a topic seed when group mention mode is %s',
+    async mentionMode => {
+      capturedHandlers = {};
+      setupBotState({
+        allowedUsers: [USER_OPEN_ID],
+        regularGroupMentionMode: mentionMode,
+      });
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+      const event = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@BotA forwarded report' }),
+        messageId: `msg-${mentionMode}-delayed`,
+        chatId: `chat-${mentionMode}-delayed`,
+        chatType: 'group',
+        mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      });
+
+      await capturedHandlers['im.message.receive_v1'](event);
+      await flushEventWork();
+
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      await new Promise(resolve => setTimeout(resolve, 30));
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+        anchor: `msg-${mentionMode}-delayed`,
+      }));
+    },
+  );
+
+  it.each(['always', 'topic'] as const)(
+    'dispatches a topic seed immediately when group mention mode is %s',
+    async mentionMode => {
+      capturedHandlers = {};
+      setupBotState({
+        allowedUsers: [USER_OPEN_ID],
+        regularGroupMentionMode: mentionMode,
+      });
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+      const event = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@BotA direct request' }),
+        messageId: `msg-${mentionMode}-immediate`,
+        chatId: `chat-${mentionMode}-immediate`,
+        chatType: 'group',
+        mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      });
+
+      await capturedHandlers['im.message.receive_v1'](event);
+      await flushEventWork();
+
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+        anchor: `msg-${mentionMode}-immediate`,
+      }));
+    },
+  );
+
+  it('keeps ambient yielding when the root-linked clarification only mentions someone else', async () => {
+    capturedHandlers = {};
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupMentionMode: 'ambient',
+    });
+    mockGetChatInfo.mockResolvedValueOnce({ userCount: 3, botCount: 2 });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA forwarded report' }),
+      messageId: 'msg-ambient-yield-seed',
+      chatId: 'chat-ambient-yield',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    const redirectedClarification = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Alice 请看一下' }),
+      rootId: 'msg-ambient-yield-seed',
+      messageId: 'msg-ambient-yield-clarification',
+      chatId: 'chat-ambient-yield',
+      chatType: 'group',
+      mentions: [{ key: '@_alice', name: 'Alice', id: { open_id: 'ou_alice' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](seed);
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](redirectedClarification);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(seed, expect.objectContaining({
+      forwardSeedData: undefined,
+    }));
+  });
+
+  it('flushes an old pending seed instead of merging after mention mode becomes always', async () => {
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA forwarded report' }),
+      messageId: 'msg-policy-change-seed',
+      chatId: 'chat-policy-change',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    const clarification = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA direct follow-up' }),
+      rootId: 'msg-policy-change-seed',
+      messageId: 'msg-policy-change-clarification',
+      chatId: 'chat-policy-change',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](seed);
+    await flushEventWork();
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupMentionMode: 'always',
+    });
+    await capturedHandlers['im.message.receive_v1'](clarification);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(2);
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(seed, expect.objectContaining({
+      forwardSeedData: undefined,
+    }));
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(clarification, expect.objectContaining({
+      forwardSeedData: undefined,
+    }));
+  });
+
+  it('continues the current message when flushing an old pending seed fails', async () => {
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA forwarded report' }),
+      messageId: 'msg-policy-flush-failure-seed',
+      chatId: 'chat-policy-flush-failure',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    const clarification = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA current message must survive' }),
+      rootId: 'msg-policy-flush-failure-seed',
+      messageId: 'msg-policy-flush-failure-clarification',
+      chatId: 'chat-policy-flush-failure',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](seed);
+    await flushEventWork();
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupMentionMode: 'always',
+    });
+    handlers.handleNewTopic.mockImplementation(async data => {
+      if (data === seed) throw new Error('seed dispatch failed');
+    });
+
+    await capturedHandlers['im.message.receive_v1'](clarification);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(clarification, expect.objectContaining({
+      forwardSeedData: undefined,
+    }));
+  });
+
   it('does not delay p2p, existing-thread, or control-command messages', async () => {
     const p2p = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
@@ -487,6 +660,49 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
     expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(restoredData, expect.objectContaining({
       anchor: 'msg-restored-seed',
+    }));
+  });
+
+  it('flushes a persisted pending seed immediately when restored under always mode', async () => {
+    const restoredData = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA restored forward' }),
+      messageId: 'msg-restored-always-seed',
+      chatId: 'chat-restored-always-seed',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    mockReadFileSync.mockImplementation(path => String(path).includes('forward-followups-')
+      ? JSON.stringify([{
+          messageId: 'msg-restored-always-seed',
+          dueAt: Date.now() + 10_000,
+          payload: {
+            data: restoredData,
+            ctx: {
+              chatId: 'chat-restored-always-seed',
+              messageId: 'msg-restored-always-seed',
+              chatType: 'group',
+              scope: 'thread',
+              anchor: 'msg-restored-always-seed',
+              larkAppId: MY_APP_ID,
+            },
+            ownsSession: false,
+          },
+        }])
+      : '[]');
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupMentionMode: 'always',
+    });
+    handlers.handleNewTopic.mockClear();
+    capturedHandlers = {};
+
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(restoredData, expect.objectContaining({
+      anchor: 'msg-restored-always-seed',
     }));
   });
 });
