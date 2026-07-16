@@ -43,6 +43,7 @@ import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled, clearPending } from './grant-pending.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { chatQuotaKey, globalQuotaKey } from '../../services/grant-store.js';
+import { ForwardFollowupBuffer } from './forward-followup-buffer.js';
 import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
 import { resolveRegularGroupMode, resolveGroupMentionMode } from '../../services/chat-reply-mode-store.js';
@@ -1401,7 +1402,15 @@ export interface RoutingContext {
   summaryCommand?: SummaryCommandRuntimeContext;
   /** This turn was triggered by @mentioning a configured substitute person. */
   substituteTrigger?: import('../../types.js').SubstituteTrigger;
+  /** Earlier topic seed coalesced into this root-linked clarification. */
+  forwardSeedData?: any;
   larkAppId: string;
+}
+
+interface PendingForwardTopicPayload {
+  data: any;
+  ctx: RoutingContext;
+  ownsSession: boolean;
 }
 
 export interface EventHandlers {
@@ -1943,6 +1952,16 @@ async function processCommentEvent(
  * Returns the WSClient instance for lifecycle management.
  */
 export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: string, handlers: EventHandlers, brand: Brand = 'feishu'): Lark.WSClient {
+  const forwardFollowups = new ForwardFollowupBuffer<PendingForwardTopicPayload>(
+    config.daemon.forwardFollowupWaitMs,
+    err => logger.error(`Error flushing delayed topic seed: ${err}`),
+  );
+  const dispatchHumanMessage = async (payload: PendingForwardTopicPayload): Promise<void> => {
+    await serializeByAnchor(payload.ctx.anchor, () => payload.ownsSession
+      ? handlers.handleThreadReply(payload.data, payload.ctx)
+      : handlers.handleNewTopic(payload.data, payload.ctx))
+      .catch(err => logger.error(`Error handling message event: ${err}`));
+  };
   const eventDispatcher = new Lark.EventDispatcher({}).register({
     // 主动开工 — 场景①: the bot was added to a chat. Hand off to the daemon,
     // which gates on the autoStartOnGroupJoin toggle + allowedUser membership.
@@ -2420,6 +2439,34 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         });
         const summaryCommandTriggered = !!summaryCommandMatch && isAllowed;
 
+        const routingText = extractMessageTextForRouting(message);
+        const strippedRoutingText = routingText
+          ? stripLeadingMentions(routingText.trim(), message?.mentions ?? []).trim()
+          : '';
+        const isControlCommand = strippedRoutingText.startsWith('/');
+        const pairedForwardSeed = senderOpenId && message.root_id && !isControlCommand
+          ? forwardFollowups.take({
+              larkAppId,
+              chatId,
+              senderOpenId,
+              rootId: message.root_id,
+            })
+          : undefined;
+        if (pairedForwardSeed) {
+          // The clarification becomes the visible Lark topic root. The earlier
+          // forwarded seed is retained only as prompt context, so the bot never
+          // emits a reply under the forwarding bubble itself.
+          routing.scope = 'thread';
+          routing.anchor = messageId;
+          routingSource = 'topic-chat';
+          replyRootId = undefined;
+          ownsSession = false;
+          logger.info(
+            `[forward-followup] merged seed=${pairedForwardSeed.messageId.substring(0, 12)} ` +
+            `into msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
+          );
+        }
+
         // Permission gating — same shape as before, just keyed on
         // `ownsSession` (anchor-aware) instead of "rootId presence":
         //
@@ -2473,7 +2520,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             && routing.scope === 'thread'
             && !!message.thread_id
             && await getChatMode(larkAppId, chatId) === 'topic';
-          const relax = (!!replyRootId && isAllowed)
+          const relax = !!pairedForwardSeed
+            || (!!replyRootId && isAllowed)
             || (!!substituteTrigger && isAllowed)
             || (isAllowed && mentionMode === 'never')
             || (isAllowed && mentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message))
@@ -2535,19 +2583,40 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             ? { name: 'summary-command', chatKind: summaryCommandMatch.chatKind }
             : undefined,
           substituteTrigger,
+          forwardSeedData: pairedForwardSeed?.payload.data,
         };
         if (explicitlyMentionedThisBot) {
           await handlers.beforeSessionTurn?.(data, ctx, { senderOpenId, explicitlyMentionedThisBot });
           ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? ownsSession;
         }
+        const payload = { data, ctx, ownsSession } satisfies PendingForwardTopicPayload;
+        const shouldDelayTopicSeed = !pairedForwardSeed
+          && !isControlCommand
+          && !!senderOpenId
+          && routingSource === 'topic-chat'
+          && ctx.scope === 'thread'
+          && ctx.anchor === messageId
+          && !ownsSession;
+        if (shouldDelayTopicSeed && forwardFollowups.hold({
+          larkAppId,
+          chatId,
+          senderOpenId,
+          messageId,
+          payload,
+          flush: dispatchHumanMessage,
+        })) {
+          logger.debug(
+            `[forward-followup] holding topic seed msg=${messageId.substring(0, 12)} ` +
+            `for ${config.daemon.forwardFollowupWaitMs}ms`,
+          );
+          return;
+        }
+
         // Serialize per anchor so two messages to the same thread/chat are
         // processed in arrival order — never concurrently. Without this a fast
         // second message interleaves with the first's async session-spawn and is
         // dropped (worker-not-ready → re-fork branch). See anchor-serializer.ts.
-        await serializeByAnchor(ctx.anchor, () => ownsSession
-          ? handlers.handleThreadReply(data, ctx)
-          : handlers.handleNewTopic(data, ctx))
-          .catch(err => logger.error(`Error handling message event: ${err}`));
+        await dispatchHumanMessage(payload);
       } catch (err) {
         logger.error(`Error handling message event: ${err}`);
       }

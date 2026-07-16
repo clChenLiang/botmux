@@ -138,6 +138,7 @@ import {
 // grant-card throttle state never leaks across cases (it backs the @blocked card path).
 import { _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
 import { logger } from '../src/utils/logger.js';
+import { config } from '../src/config.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -148,11 +149,109 @@ const OTHER_BOT_APP_ID = 'app-bot-b';
 const USER_OPEN_ID = 'ou_user_123';
 
 beforeEach(() => {
+  config.daemon.forwardFollowupWaitMs = 0;
   mockListChatMessages.mockReset().mockResolvedValue([]);
   mockListChatMessagesUntil.mockReset().mockResolvedValue([]);
   mockListThreadMessages.mockReset().mockResolvedValue([]);
   mockGetMessageDetail.mockReset().mockResolvedValue({ items: [] });
   mockIsSubstituteEnabledForChat.mockReset().mockReturnValue(true);
+});
+
+describe('im.message.receive_v1 — forwarded topic clarification coalescing', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('topic');
+    config.daemon.forwardFollowupWaitMs = 25;
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('holds a topic seed, then starts from its root-linked clarification', async () => {
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA forwarded report' }),
+      messageId: 'msg-forward-seed',
+      chatId: 'chat-forward',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    const clarification = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '请分析这个慢查询' }),
+      rootId: 'msg-forward-seed',
+      messageId: 'msg-forward-clarification',
+      chatId: 'chat-forward',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](seed);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+    await capturedHandlers['im.message.receive_v1'](clarification);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(clarification, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-forward-clarification',
+      messageId: 'msg-forward-clarification',
+      forwardSeedData: seed,
+    }));
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('flushes an unmatched topic seed after the configured wait', async () => {
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA standalone topic' }),
+      messageId: 'msg-standalone-seed',
+      chatId: 'chat-standalone',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](seed);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(seed, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-standalone-seed',
+    }));
+  });
+
+  it('does not delay an ordinary-group message', async () => {
+    mockGetChatMode.mockResolvedValue('group');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA regular group request' }),
+      messageId: 'msg-regular-immediate',
+      chatId: 'chat-regular-immediate',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-regular-immediate',
+      forwardSeedData: undefined,
+    }));
+  });
 });
 
 type TestMention = {
