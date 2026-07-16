@@ -43,9 +43,11 @@ import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled, clearPending } from './grant-pending.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { chatQuotaKey, globalQuotaKey } from '../../services/grant-store.js';
+import { ForwardFollowupBuffer } from './forward-followup-buffer.js';
+import { listForwardFollowups, putForwardFollowup, removeForwardFollowup } from './forward-followup-store.js';
 import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
-import { resolveRegularGroupMode, resolveGroupMentionMode } from '../../services/chat-reply-mode-store.js';
+import { resolveRegularGroupMode, resolveGroupMentionMode, type GroupMentionMode } from '../../services/chat-reply-mode-store.js';
 import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
 import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
 import { isSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
@@ -567,10 +569,10 @@ function claimEventOnce(key: string): boolean {
 // persistent message_id claim (claimMessageOnce) so a daemon restart or the 6h
 // re-push tier can't replay an already-handled message. The claim MUST be fully
 // synchronous (see INVARIANT below) — both claimEventOnce and claimMessageOnce are.
-function scheduleAckSafeEvent(key: string, work: () => Promise<void>, label: string, claim: () => boolean = () => claimEventOnce(key)): void {
+function scheduleAckSafeEvent(key: string, work: () => Promise<void>, label: string, claim: () => boolean = () => claimEventOnce(key)): boolean {
   if (!claim()) {
     logger.info(`[event-dedupe] duplicate ${label} ignored: ${key}`);
-    return;
+    return false;
   }
   // INVARIANT: the claim above + this setImmediate scheduling must stay fully
   // synchronous (no await before we get here). WS events arrive in order and
@@ -580,6 +582,7 @@ function scheduleAckSafeEvent(key: string, work: () => Promise<void>, label: str
   setImmediate(() => {
     void work().catch(err => logger.error(`Error handling ${label}: ${err}`));
   });
+  return true;
 }
 
 // Fallback for an event that carries no stable id at all. Dedupe must never
@@ -1401,7 +1404,19 @@ export interface RoutingContext {
   summaryCommand?: SummaryCommandRuntimeContext;
   /** This turn was triggered by @mentioning a configured substitute person. */
   substituteTrigger?: import('../../types.js').SubstituteTrigger;
+  /** Earlier topic seed coalesced into this root-linked clarification. */
+  forwardSeedData?: any;
   larkAppId: string;
+}
+
+interface PendingForwardTopicPayload {
+  data: any;
+  ctx: RoutingContext;
+  ownsSession: boolean;
+}
+
+function usesForwardFollowupDelay(mentionMode: GroupMentionMode): boolean {
+  return mentionMode === 'never' || mentionMode === 'ambient';
 }
 
 export interface EventHandlers {
@@ -1943,6 +1958,69 @@ async function processCommentEvent(
  * Returns the WSClient instance for lifecycle management.
  */
 export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: string, handlers: EventHandlers, brand: Brand = 'feishu'): Lark.WSClient {
+  const forwardFollowups = new ForwardFollowupBuffer<PendingForwardTopicPayload>(
+    config.daemon.forwardFollowupWaitMs,
+    err => logger.error(`Error flushing delayed topic seed: ${err}`),
+  );
+  const dispatchHumanMessage = async (payload: PendingForwardTopicPayload): Promise<void> => {
+    await serializeByAnchor(payload.ctx.anchor, () => {
+      const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
+      return ownsSession
+        ? handlers.handleThreadReply(payload.data, payload.ctx)
+        : handlers.handleNewTopic(payload.data, payload.ctx);
+    });
+  };
+  const dispatchPersistedForwardFollowup = async (
+    seedMessageId: string,
+    payload: PendingForwardTopicPayload,
+  ): Promise<void> => {
+    await dispatchHumanMessage(payload);
+    removeForwardFollowup(larkAppId, seedMessageId);
+  };
+  for (const record of listForwardFollowups<PendingForwardTopicPayload>(larkAppId)) {
+    const senderOpenId = record.payload?.data?.sender?.sender_id?.open_id as string | undefined;
+    const chatId = record.payload?.ctx?.chatId;
+    if (!senderOpenId || !chatId || !record.payload?.ctx?.anchor) {
+      removeForwardFollowup(larkAppId, record.messageId);
+      continue;
+    }
+    const flush = (payload: PendingForwardTopicPayload) =>
+      dispatchPersistedForwardFollowup(record.messageId, payload);
+    const remainingMs = record.dueAt - Date.now();
+    const isUnpairedSeed = !record.payload.ctx.forwardSeedData;
+    const delayStillEnabled = usesForwardFollowupDelay(resolveGroupMentionMode(larkAppId));
+    if (isUnpairedSeed && delayStillEnabled && remainingMs > 0 && forwardFollowups.hold({
+      larkAppId,
+      chatId,
+      senderOpenId,
+      messageId: record.messageId,
+      payload: record.payload,
+      flush,
+    }, remainingMs)) {
+      logger.info(`[forward-followup] restored pending seed=${record.messageId.substring(0, 12)} remaining=${remainingMs}ms`);
+    } else {
+      void flush(record.payload).catch(err => logger.error(`Error restoring delayed topic seed: ${err}`));
+    }
+  }
+  const seedRoutingGates = new Map<string, { ready: Promise<void>; complete: () => void }>();
+  const registerSeedRoutingGate = (messageId: string) => {
+    let resolveReady!: () => void;
+    const ready = new Promise<void>(resolve => { resolveReady = resolve; });
+    let completed = false;
+    const gate = {
+      ready,
+      complete: () => {
+        if (completed) return;
+        completed = true;
+        resolveReady();
+        setTimeout(() => {
+          if (seedRoutingGates.get(messageId) === gate) seedRoutingGates.delete(messageId);
+        }, config.daemon.forwardFollowupWaitMs);
+      },
+    };
+    seedRoutingGates.set(messageId, gate);
+    return gate;
+  };
   const eventDispatcher = new Lark.EventDispatcher({}).register({
     // 主动开工 — 场景①: the bot was added to a chat. Hand off to the daemon,
     // which gates on the autoStartOnGroupJoin toggle + allowedUser membership.
@@ -1992,7 +2070,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const claim = messageIdForKey
         ? () => claimMessageOnce(larkAppId, messageIdForKey)
         : () => claimEventOnce(eventKey);
-      scheduleAckSafeEvent(eventKey, async () => {
+      let seedRoutingGate: { ready: Promise<void>; complete: () => void } | undefined;
+      const scheduled = scheduleAckSafeEvent(eventKey, async () => {
       try {
         const message = data.message;
         const sender = data.sender;
@@ -2420,6 +2499,79 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         });
         const summaryCommandTriggered = !!summaryCommandMatch && isAllowed;
 
+        const routingText = extractMessageTextForRouting(message);
+        const strippedRoutingText = routingText
+          ? stripLeadingMentions(routingText.trim(), message?.mentions ?? []).trim()
+          : '';
+        const isControlCommand = strippedRoutingText.startsWith('/');
+        let pairedForwardSeed;
+        if (senderOpenId && message.root_id && !isControlCommand) {
+          await seedRoutingGates.get(message.root_id)?.ready;
+          const pairingInput = {
+            larkAppId,
+            chatId,
+            senderOpenId,
+            rootId: message.root_id,
+          };
+          const pairingMentionMode = resolveGroupMentionMode(larkAppId);
+          const ambientRedirect = pairingMentionMode === 'ambient'
+            && !explicitlyMentionedThisBot
+            && mentionsAnotherMember(larkAppId, message);
+          const pairingDelayEnabled = usesForwardFollowupDelay(pairingMentionMode);
+          if (pairingDelayEnabled && !ambientRedirect) {
+            pairedForwardSeed = forwardFollowups.take(pairingInput);
+          } else if (!pairingDelayEnabled) {
+            const stalePendingSeed = forwardFollowups.take(pairingInput);
+            if (stalePendingSeed) {
+              try {
+                await dispatchPersistedForwardFollowup(stalePendingSeed.messageId, stalePendingSeed.payload);
+              } catch (err) {
+                logger.warn(
+                  `[forward-followup] failed to flush stale seed=${stalePendingSeed.messageId.substring(0, 12)}; ` +
+                  `continuing current msg=${messageId.substring(0, 12)}: ${err}`,
+                );
+              }
+            }
+          }
+        }
+        if (pairedForwardSeed) {
+          // The clarification becomes the visible Lark topic root. The earlier
+          // forwarded seed is retained only as prompt context, so the bot never
+          // emits a reply under the forwarding bubble itself.
+          routing.scope = 'thread';
+          routing.anchor = messageId;
+          routingSource = 'topic-chat';
+          replyRootId = undefined;
+          ownsSession = false;
+          try {
+            putForwardFollowup(larkAppId, {
+              messageId: pairedForwardSeed.messageId,
+              dueAt: Date.now(),
+              payload: {
+                data,
+                ctx: {
+                  ...pairedForwardSeed.payload.ctx,
+                  chatId,
+                  messageId,
+                  chatType,
+                  larkAppId,
+                  scope: 'thread',
+                  anchor: messageId,
+                  replyRootId: undefined,
+                  forwardSeedData: pairedForwardSeed.payload.data,
+                },
+                ownsSession: false,
+              },
+            });
+          } catch (err) {
+            logger.warn(`[forward-followup] failed to persist provisional paired payload: ${err}`);
+          }
+          logger.info(
+            `[forward-followup] merged seed=${pairedForwardSeed.messageId.substring(0, 12)} ` +
+            `into msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
+          );
+        }
+
         // Permission gating — same shape as before, just keyed on
         // `ownsSession` (anchor-aware) instead of "rootId presence":
         //
@@ -2473,7 +2625,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             && routing.scope === 'thread'
             && !!message.thread_id
             && await getChatMode(larkAppId, chatId) === 'topic';
-          const relax = (!!replyRootId && isAllowed)
+          const relax = !!pairedForwardSeed
+            || (!!replyRootId && isAllowed)
             || (!!substituteTrigger && isAllowed)
             || (isAllowed && mentionMode === 'never')
             || (isAllowed && mentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message))
@@ -2535,23 +2688,90 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             ? { name: 'summary-command', chatKind: summaryCommandMatch.chatKind }
             : undefined,
           substituteTrigger,
+          forwardSeedData: pairedForwardSeed?.payload.data,
         };
         if (explicitlyMentionedThisBot) {
           await handlers.beforeSessionTurn?.(data, ctx, { senderOpenId, explicitlyMentionedThisBot });
           ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? ownsSession;
         }
+        const payload = { data, ctx, ownsSession } satisfies PendingForwardTopicPayload;
+        const groupMentionMode = resolveGroupMentionMode(larkAppId);
+        const shouldDelayTopicSeed = usesForwardFollowupDelay(groupMentionMode)
+          && !pairedForwardSeed
+          && !isControlCommand
+          && !!senderOpenId
+          && routingSource === 'topic-chat'
+          && ctx.scope === 'thread'
+          && ctx.anchor === messageId
+          && !ownsSession;
+        if (shouldDelayTopicSeed) {
+          try {
+            putForwardFollowup(larkAppId, {
+              messageId,
+              dueAt: Date.now() + config.daemon.forwardFollowupWaitMs,
+              payload,
+            });
+            if (forwardFollowups.hold({
+              larkAppId,
+              chatId,
+              senderOpenId,
+              messageId,
+              payload,
+              flush: delayedPayload => dispatchPersistedForwardFollowup(messageId, delayedPayload),
+            })) {
+              logger.debug(
+                `[forward-followup] holding topic seed msg=${messageId.substring(0, 12)} ` +
+                `for ${config.daemon.forwardFollowupWaitMs}ms`,
+              );
+              return;
+            }
+            removeForwardFollowup(larkAppId, messageId);
+          } catch (err) {
+            logger.warn(`[forward-followup] persistence unavailable, dispatching immediately: ${err}`);
+          }
+        }
+
+        if (pairedForwardSeed) {
+          try {
+            putForwardFollowup(larkAppId, {
+              messageId: pairedForwardSeed.messageId,
+              dueAt: Date.now(),
+              payload,
+            });
+          } catch (err) {
+            logger.warn(`[forward-followup] failed to persist paired payload before dispatch: ${err}`);
+          }
+          await dispatchPersistedForwardFollowup(pairedForwardSeed.messageId, payload)
+            .catch(err => logger.error(`Error handling paired message event: ${err}`));
+          return;
+        }
+
         // Serialize per anchor so two messages to the same thread/chat are
         // processed in arrival order — never concurrently. Without this a fast
         // second message interleaves with the first's async session-spawn and is
         // dropped (worker-not-ready → re-fork branch). See anchor-serializer.ts.
-        await serializeByAnchor(ctx.anchor, () => ownsSession
-          ? handlers.handleThreadReply(data, ctx)
-          : handlers.handleNewTopic(data, ctx))
+        await dispatchHumanMessage(payload)
           .catch(err => logger.error(`Error handling message event: ${err}`));
       } catch (err) {
         logger.error(`Error handling message event: ${err}`);
+      } finally {
+        seedRoutingGate?.complete();
       }
       }, 'message event', claim);
+      const rawMessage = data?.message;
+      const rawSenderType = data?.sender?.sender_type;
+      if (
+        scheduled
+        && config.daemon.forwardFollowupWaitMs > 0
+        && rawMessage?.message_id
+        && rawMessage.chat_type !== 'p2p'
+        && !rawMessage.root_id
+        && !rawMessage.thread_id
+        && rawSenderType !== 'app'
+        && rawSenderType !== 'bot'
+      ) {
+        seedRoutingGate = registerSeedRoutingGate(rawMessage.message_id);
+      }
     },
   });
 
