@@ -40,7 +40,7 @@ import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from '
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
 import { createImgNumberer, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
-import { bindResourcesToMessage, composeForwardFollowupContent } from './im/lark/forward-followup-content.js';
+import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
 import { logger } from './utils/logger.js';
 import { delay } from './utils/timing.js';
@@ -6547,6 +6547,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const numberer = createImgNumberer();
   let forwardSeedContent = '';
   let forwardSeedResources: MessageResource[] = [];
+  let forwardSeedMentions: import('./types.js').LarkMention[] | undefined;
   if (ctx.forwardSeedData) {
     await resolveNonsupportMessage(ctx.forwardSeedData, larkAppId);
     const seedMessageId = ctx.forwardSeedData.message?.message_id as string | undefined;
@@ -6560,7 +6561,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       );
       seedResult.resources.push(...extraResources);
     }
-    learnFromMentions(larkAppId, seedResult.parsed.mentions);
+    forwardSeedMentions = seedResult.parsed.mentions;
     forwardSeedContent = seedResult.parsed.content.trim();
     forwardSeedResources = seedMessageId
       ? bindResourcesToMessage(seedResult.resources, seedMessageId)
@@ -6568,6 +6569,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   }
   await resolveNonsupportMessage(data, larkAppId);
   const { parsed, resources } = parseEventMessage(data, numberer);
+  const followupMentions = parsed.mentions;
 
   // Expand merge_forward: fetch sub-messages and collect their resources
   if (parsed.msgType === 'merge_forward') {
@@ -6575,6 +6577,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     resources.push(...extraResources);
   }
   resources.unshift(...forwardSeedResources);
+  parsed.mentions = mergeMessageMentions(forwardSeedMentions, followupMentions);
 
   // Free-path identity learning — mentions carry (name, open_id) pairs, so
   // every event that flows through us teaches the cache without touching
@@ -6584,7 +6587,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const followupContent = parsed.content.trim();
   let content = composeForwardFollowupContent(forwardSeedContent, followupContent);
   // Strip leading @<bot> mentions so "@bot /oncall bind" is recognized as a command.
-  let cmdContent = stripLeadingMentions(followupContent, parsed.mentions);
+  let cmdContent = stripLeadingMentions(followupContent, followupMentions);
 
   // `/t` / `/topic` — force the bot to reply in a thread, even in 普通群.
   // In 普通群 the inbound message is chat-scope by default; override to

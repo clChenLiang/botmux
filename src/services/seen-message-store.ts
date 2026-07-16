@@ -115,6 +115,17 @@ export function claimMessageOnce(larkAppId: string, messageId: string, now = Dat
 }
 
 /**
+ * Temporarily relinquish a claim while a message lives only in an in-memory
+ * delay buffer. The caller must claim it again immediately before dispatch.
+ */
+export function releaseMessageClaim(larkAppId: string, messageId: string): void {
+  if (!messageId) return;
+  const cache = load(larkAppId);
+  if (!cache.map.delete(messageId)) return;
+  persist(larkAppId, cache.map);
+}
+
+/**
  * Test-only：清空进程内缓存（**不删盘**），用于模拟「daemon 重启」后从盘重新载入，
  * 验证去重跨重启仍生效。
  */

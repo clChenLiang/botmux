@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   bindResourcesToMessage,
   composeForwardFollowupContent,
+  mergeMessageMentions,
 } from '../src/im/lark/forward-followup-content.js';
 
 describe('forward follow-up content', () => {
@@ -24,6 +25,19 @@ describe('forward follow-up content', () => {
     ], 'seed-message')).toEqual([
       { type: 'image', key: 'img-1', name: 'img-1.jpg', messageId: 'seed-message' },
       { type: 'file', key: 'file-1', name: 'a.txt', messageId: 'nested-message' },
+    ]);
+  });
+
+  it('merges mention metadata and deduplicates the same identity', () => {
+    expect(mergeMessageMentions(
+      [{ key: '@seed', name: 'Bot A', openId: 'ou_a' }],
+      [
+        { key: '@followup', name: 'Bot A', openId: 'ou_a', unionId: 'on_a' },
+        { key: '@user', name: 'User B', openId: 'ou_b' },
+      ],
+    )).toEqual([
+      { key: '@seed', name: 'Bot A', openId: 'ou_a', unionId: 'on_a' },
+      { key: '@user', name: 'User B', openId: 'ou_b' },
     ]);
   });
 });

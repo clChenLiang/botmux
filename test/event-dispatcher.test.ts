@@ -209,6 +209,42 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
     expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
   });
 
+  it('waits for an earlier seed still resolving routing before matching the clarification', async () => {
+    let resolveTopic!: (mode: 'topic') => void;
+    const delayedTopic = new Promise<'topic'>(resolve => { resolveTopic = resolve; });
+    mockGetChatMode.mockImplementationOnce(() => delayedTopic).mockResolvedValue('topic');
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA forwarded report' }),
+      messageId: 'msg-racing-seed',
+      chatId: 'chat-racing-forward',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    const clarification = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '补充说明' }),
+      rootId: 'msg-racing-seed',
+      messageId: 'msg-racing-clarification',
+      chatId: 'chat-racing-forward',
+      chatType: 'group',
+    });
+
+    capturedHandlers['im.message.receive_v1'](seed);
+    capturedHandlers['im.message.receive_v1'](clarification);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+    resolveTopic('topic');
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(clarification, expect.objectContaining({
+      anchor: 'msg-racing-clarification',
+      forwardSeedData: seed,
+    }));
+  });
+
   it('flushes an unmatched topic seed after the configured wait', async () => {
     const seed = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
@@ -231,6 +267,28 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
     }));
   });
 
+  it('rechecks session ownership when a delayed seed flushes', async () => {
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA delayed seed' }),
+      messageId: 'msg-delayed-owner',
+      chatId: 'chat-delayed-owner',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](seed);
+    await flushEventWork();
+    handlers.isSessionOwner.mockImplementation(anchor => anchor === 'msg-delayed-owner');
+
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(seed, expect.objectContaining({
+      anchor: 'msg-delayed-owner',
+    }));
+  });
+
   it('does not delay an ordinary-group message', async () => {
     mockGetChatMode.mockResolvedValue('group');
     const event = makeUserMessageEvent({
@@ -250,6 +308,97 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
       scope: 'chat',
       anchor: 'chat-regular-immediate',
       forwardSeedData: undefined,
+    }));
+  });
+
+  it('does not delay p2p, existing-thread, or control-command messages', async () => {
+    const p2p = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'direct request' }),
+      messageId: 'msg-p2p-immediate',
+      chatId: 'chat-p2p-immediate',
+      chatType: 'p2p',
+    });
+    const existingThread = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA continue' }),
+      rootId: 'root-existing-topic',
+      messageId: 'msg-existing-topic',
+      chatId: 'chat-existing-topic',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    const control = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA /t do this now' }),
+      messageId: 'msg-control-immediate',
+      chatId: 'chat-control-immediate',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.isSessionOwner.mockImplementation(anchor => anchor === 'root-existing-topic');
+
+    capturedHandlers['im.message.receive_v1'](p2p);
+    capturedHandlers['im.message.receive_v1'](existingThread);
+    capturedHandlers['im.message.receive_v1'](control);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(existingThread, expect.objectContaining({
+      anchor: 'root-existing-topic',
+    }));
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(p2p, expect.objectContaining({
+      anchor: 'msg-p2p-immediate',
+    }));
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(control, expect.objectContaining({
+      anchor: 'msg-control-immediate',
+    }));
+  });
+
+  it('does not merge a root-linked message from another sender', async () => {
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA private forward' }),
+      messageId: 'msg-sender-seed',
+      chatId: 'chat-sender-isolation',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    const otherSender = makeUserMessageEvent({
+      senderOpenId: 'ou_other_sender',
+      content: JSON.stringify({ text: 'try to attach' }),
+      rootId: 'msg-sender-seed',
+      messageId: 'msg-other-sender',
+      chatId: 'chat-sender-isolation',
+      chatType: 'group',
+    });
+
+    capturedHandlers['im.message.receive_v1'](seed);
+    capturedHandlers['im.message.receive_v1'](otherSender);
+    await flushEventWork();
+    await new Promise(resolve => setTimeout(resolve, 30));
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(seed, expect.anything());
+  });
+
+  it('dispatches topic seeds immediately when the wait is disabled', async () => {
+    capturedHandlers = {};
+    config.daemon.forwardFollowupWaitMs = 0;
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA no grace period' }),
+      messageId: 'msg-wait-disabled',
+      chatId: 'chat-wait-disabled',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      anchor: 'msg-wait-disabled',
     }));
   });
 });
