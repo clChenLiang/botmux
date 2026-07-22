@@ -243,6 +243,20 @@ describe('task action cards', () => {
     expect(() => buildTaskCompletionCard({ ...COMPLETION, environment: 'PPE\u2060spoofed' })).toThrow(/environment/);
   });
 
+  it.each([
+    ['NEXT LINE', '\u0085'],
+    ['LINE SEPARATOR', '\u2028'],
+    ['PARAGRAPH SEPARATOR', '\u2029'],
+    ['ZERO WIDTH SPACE', '\u200B'],
+    ['WORD JOINER', '\u2060'],
+    ['ZERO WIDTH NO-BREAK SPACE', '\uFEFF'],
+  ])('rejects Unicode %s in title and environment', (_name, character) => {
+    expect(() => buildTaskCandidateCard({ ...CANDIDATE, title: `safe${character}spoofed` }))
+      .toThrow(/title/);
+    expect(() => buildTaskCompletionCard({ ...COMPLETION, environment: `safe${character}spoofed` }))
+      .toThrow(/environment/);
+  });
+
   it.each(['summary', 'recommendationReason', 'risk', 'validationMethod'] as const)(
     'allows multiline prose but rejects bidi controls in %s',
     (field) => {
@@ -250,4 +264,26 @@ describe('task action cards', () => {
       expect(() => buildTaskCandidateCard({ ...CANDIDATE, [field]: 'safe\u202Espoofed' })).toThrow(new RegExp(field));
     },
   );
+
+  it.each([
+    ['CARRIAGE RETURN', '\r'],
+    ['NEXT LINE', '\u0085'],
+    ['LINE SEPARATOR', '\u2028'],
+    ['PARAGRAPH SEPARATOR', '\u2029'],
+    ['ZERO WIDTH SPACE', '\u200B'],
+    ['WORD JOINER', '\u2060'],
+    ['ZERO WIDTH NO-BREAK SPACE', '\uFEFF'],
+  ])('rejects Unicode %s in multiline prose while retaining ordinary LF', (_name, character) => {
+    expect(() => buildTaskCandidateCard({ ...CANDIDATE, summary: `line one${character}line two` }))
+      .toThrow(/summary/);
+    expect(() => buildTaskCandidateCard({ ...CANDIDATE, summary: 'line one\nline two' })).not.toThrow();
+  });
+
+  it('retains valid CJK, emoji ZWJ sequences and variation selectors', () => {
+    expect(() => buildTaskCandidateCard({
+      ...CANDIDATE,
+      title: '修复预览页 ✅',
+      summary: '支持家庭组合 emoji 👨‍👩‍👧‍👦 与文本变体 ✈️。',
+    })).not.toThrow();
+  });
 });

@@ -49,9 +49,11 @@ type CallbackValue = Readonly<Record<string, string>>;
 type ButtonType = 'primary' | 'danger' | 'default';
 
 const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-const CONTROL_EXCEPT_TAB_LF = /[\u0000-\u0008\u000b-\u001f\u007f]/;
-const BIDI_CONTROL = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
-const INVISIBLE_FORMATTING = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufeff\uffa0]/;
+// Explicit security sets: keep ordinary CJK, ZWJ/ZWNJ and variation selectors
+// valid, while excluding controls, alternate line breaks and spoofing formatters.
+const SINGLE_LINE_CONTROL_OR_SEPARATOR = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+const PROSE_CONTROL_OR_SEPARATOR = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029]/;
+const UNSAFE_INVISIBLE_FORMATTING = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b\u200e\u200f\u202a-\u202e\u2060-\u206f\u3164\ufeff\uffa0\ufff9-\ufffb]/;
 
 export function buildTaskCandidateCard(input: TaskCandidateCardInput): string {
   const candidateId = opaqueId(input.candidateId, 'candidateId');
@@ -166,7 +168,7 @@ function opaqueId(value: string, field: string): string {
 
 function singleLineText(value: string, field: string, maxLength: number): string {
   if (typeof value !== 'string' || value.trim().length === 0 || value.length > maxLength
-    || /[\t\r\n]/.test(value) || CONTROL_EXCEPT_TAB_LF.test(value) || INVISIBLE_FORMATTING.test(value)) {
+    || SINGLE_LINE_CONTROL_OR_SEPARATOR.test(value) || UNSAFE_INVISIBLE_FORMATTING.test(value)) {
     throw new Error(`${field} must be single-line visible text up to ${maxLength} characters`);
   }
   return value;
@@ -174,7 +176,7 @@ function singleLineText(value: string, field: string, maxLength: number): string
 
 function proseText(value: string, field: string, maxLength: number): string {
   if (typeof value !== 'string' || value.trim().length === 0 || value.length > maxLength
-    || CONTROL_EXCEPT_TAB_LF.test(value) || BIDI_CONTROL.test(value)) {
+    || PROSE_CONTROL_OR_SEPARATOR.test(value) || UNSAFE_INVISIBLE_FORMATTING.test(value)) {
     throw new Error(`${field} must be safe display text up to ${maxLength} characters`);
   }
   return value;
@@ -182,7 +184,8 @@ function proseText(value: string, field: string, maxLength: number): string {
 
 function safeHttpsUrl(value: string, field: string): string {
   if (typeof value !== 'string' || value.length === 0 || value.length > 2_048
-    || /\s/.test(value) || CONTROL_EXCEPT_TAB_LF.test(value) || INVISIBLE_FORMATTING.test(value)) {
+    || /\s/.test(value) || SINGLE_LINE_CONTROL_OR_SEPARATOR.test(value)
+    || UNSAFE_INVISIBLE_FORMATTING.test(value)) {
     throw new Error(`${field} must be a safe HTTPS URL`);
   }
 
