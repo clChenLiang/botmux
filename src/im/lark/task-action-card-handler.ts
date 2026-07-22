@@ -28,20 +28,34 @@ export interface TaskActionPersistenceRequest {
   operatorOpenId: string;
 }
 
-export type TaskActionPersistenceResult =
-  | { outcome: 'recorded' }
-  | { outcome: 'duplicate' | 'conflict'; effectiveAction: TaskAction };
+type PersistedTaskAction = Exclude<TaskAction, typeof MR_KEEP_WATCHING_ACTION>;
+
+export type TaskActionPersistenceResult = {
+  outcome: 'recorded' | 'duplicate' | 'conflict';
+  effectiveAction: PersistedTaskAction;
+} & (
+  | { triggerRequired: true; idempotencyKey: string }
+  | { triggerRequired: false }
+);
 
 export interface TaskActionTriggerRequest {
   action: typeof TASK_ALLOW_ACTION | typeof TASK_DISCUSS_ACTION | typeof TASK_FEEDBACK_ACTION;
   candidateId: string;
   mode: 'work' | 'discussion' | 'feedback';
   operatorOpenId: string;
+  /** Stable opaque key allocated by the durable sink/outbox. */
+  idempotencyKey: string;
 }
 
 export interface TaskActionHandlerDeps {
   isAuthorized: (operatorOpenId: string) => boolean | Promise<boolean>;
   persist: (request: TaskActionPersistenceRequest) => Promise<TaskActionPersistenceResult>;
+  /**
+   * At-least-once boundary: the durable sink atomically decides whether this
+   * callback owns a delivery attempt. A claimed attempt may be retried after a
+   * crash or failure, always with the same idempotencyKey. Downstream execution
+   * must deduplicate that key and durably mark the outbox item dispatched.
+   */
   trigger: (request: TaskActionTriggerRequest) => void | Promise<void>;
 }
 
@@ -90,7 +104,7 @@ export async function handleTaskActionCard(
   } catch {
     return unauthorizedResult();
   }
-  if (!authorized) return unauthorizedResult();
+  if (authorized !== true) return unauthorizedResult();
 
   if (parsed.action === MR_KEEP_WATCHING_ACTION) {
     return toast('info', '将继续关注此 MR');
@@ -107,9 +121,25 @@ export async function handleTaskActionCard(
     return persistenceFailedResult();
   }
 
-  const safePersisted = parsePersistenceResult(persisted);
+  const safePersisted = parsePersistenceResult(persisted, parsed);
   if (!safePersisted) return persistenceFailedResult();
   persisted = safePersisted;
+
+  if (persisted.triggerRequired) {
+    const triggerRequest = toTriggerRequest(
+      parsed.subject,
+      persisted.effectiveAction,
+      parsed.operatorOpenId,
+      persisted.idempotencyKey,
+    );
+    if (!triggerRequest) return persistenceFailedResult();
+    try {
+      await deps.trigger(triggerRequest);
+    } catch {
+      return toast('warning', '操作已保存，自动启动暂时失败');
+    }
+  }
+
   if (persisted.outcome !== 'recorded') {
     if (persisted.outcome === 'duplicate' && persisted.effectiveAction === parsed.action) {
       return toast('info', '该操作已处理，无需重复提交');
@@ -118,15 +148,6 @@ export async function handleTaskActionCard(
       'warning',
       `任务已按「${ACTION_LABELS[persisted.effectiveAction]}」处理，本次操作未生效`,
     );
-  }
-
-  const triggerRequest = toTriggerRequest(parsed);
-  if (triggerRequest) {
-    try {
-      await deps.trigger(triggerRequest);
-    } catch {
-      return toast('warning', '操作已保存，自动启动暂时失败');
-    }
   }
 
   return successFor(parsed.action);
@@ -181,30 +202,38 @@ function subjectFor(action: TaskAction, value: PlainRecord): TaskActionSubject |
     : undefined;
 }
 
-function toTriggerRequest(parsed: ParsedCallback): TaskActionTriggerRequest | undefined {
-  if (parsed.subject.type !== 'candidate') return undefined;
-  if (parsed.action === TASK_ALLOW_ACTION) {
+function toTriggerRequest(
+  subject: TaskActionSubject,
+  action: PersistedTaskAction,
+  operatorOpenId: string,
+  idempotencyKey: string,
+): TaskActionTriggerRequest | undefined {
+  if (subject.type !== 'candidate') return undefined;
+  if (action === TASK_ALLOW_ACTION) {
     return {
-      action: parsed.action,
-      candidateId: parsed.subject.id,
+      action,
+      candidateId: subject.id,
       mode: 'work',
-      operatorOpenId: parsed.operatorOpenId,
+      operatorOpenId,
+      idempotencyKey,
     };
   }
-  if (parsed.action === TASK_DISCUSS_ACTION) {
+  if (action === TASK_DISCUSS_ACTION) {
     return {
-      action: parsed.action,
-      candidateId: parsed.subject.id,
+      action,
+      candidateId: subject.id,
       mode: 'discussion',
-      operatorOpenId: parsed.operatorOpenId,
+      operatorOpenId,
+      idempotencyKey,
     };
   }
-  if (parsed.action === TASK_FEEDBACK_ACTION) {
+  if (action === TASK_FEEDBACK_ACTION) {
     return {
-      action: parsed.action,
-      candidateId: parsed.subject.id,
+      action,
+      candidateId: subject.id,
       mode: 'feedback',
-      operatorOpenId: parsed.operatorOpenId,
+      operatorOpenId,
+      idempotencyKey,
     };
   }
   return undefined;
@@ -229,7 +258,10 @@ function successFor(action: TaskAction): TaskActionHandlerResult {
   }
 }
 
-function parsePersistenceResult(value: unknown): TaskActionPersistenceResult | undefined {
+function parsePersistenceResult(
+  value: unknown,
+  callback: ParsedCallback,
+): TaskActionPersistenceResult | undefined {
   let data: unknown;
   try {
     data = copyPlainData(value, new WeakSet<object>(), 0);
@@ -237,16 +269,52 @@ function parsePersistenceResult(value: unknown): TaskActionPersistenceResult | u
     return undefined;
   }
   if (!isRecord(data)) return undefined;
-  if (data.outcome === 'recorded') return { outcome: 'recorded' };
-  if ((data.outcome === 'duplicate' || data.outcome === 'conflict')
-    && typeof data.effectiveAction === 'string'
-    && KNOWN_ACTIONS.has(data.effectiveAction)) {
+  if (data.outcome !== 'recorded' && data.outcome !== 'duplicate' && data.outcome !== 'conflict') {
+    return undefined;
+  }
+  if (typeof data.effectiveAction !== 'string'
+    || data.effectiveAction === MR_KEEP_WATCHING_ACTION
+    || !KNOWN_ACTIONS.has(data.effectiveAction)) return undefined;
+  const effectiveAction = data.effectiveAction as PersistedTaskAction;
+  if (!isEffectiveActionAllowed(callback, effectiveAction)) return undefined;
+  if (data.outcome === 'recorded' && effectiveAction !== callback.action) return undefined;
+  if (data.outcome === 'duplicate' && effectiveAction !== callback.action) return undefined;
+  if (data.outcome === 'conflict' && effectiveAction === callback.action) return undefined;
+  if (typeof data.triggerRequired !== 'boolean') return undefined;
+
+  if (data.triggerRequired) {
+    if (!isOpaqueId(data.idempotencyKey) || !isTriggerableAction(effectiveAction)) return undefined;
     return {
       outcome: data.outcome,
-      effectiveAction: data.effectiveAction as TaskAction,
+      effectiveAction,
+      triggerRequired: true,
+      idempotencyKey: data.idempotencyKey,
     };
   }
-  return undefined;
+  if (Object.hasOwn(data, 'idempotencyKey')) return undefined;
+  return {
+    outcome: data.outcome,
+    effectiveAction,
+    triggerRequired: false,
+  };
+}
+
+function isEffectiveActionAllowed(
+  callback: ParsedCallback,
+  effectiveAction: PersistedTaskAction,
+): boolean {
+  if (callback.subject.type === 'mr') return effectiveAction === MR_IGNORE_ACTION;
+  if (callback.subject.type === 'repository') return effectiveAction === REPOSITORY_IGNORE_ACTION;
+  if (callback.action === TASK_FEEDBACK_ACTION) return effectiveAction === TASK_FEEDBACK_ACTION;
+  return effectiveAction === TASK_ALLOW_ACTION
+    || effectiveAction === TASK_REJECT_ACTION
+    || effectiveAction === TASK_DISCUSS_ACTION;
+}
+
+function isTriggerableAction(action: PersistedTaskAction): action is TaskActionTriggerRequest['action'] {
+  return action === TASK_ALLOW_ACTION
+    || action === TASK_DISCUSS_ACTION
+    || action === TASK_FEEDBACK_ACTION;
 }
 
 function isOpaqueId(value: unknown): value is string {
