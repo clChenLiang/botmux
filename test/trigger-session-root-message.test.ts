@@ -186,6 +186,21 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(send).toHaveBeenCalledWith({ type: 'message', content: expect.stringContaining('follow:') });
   });
 
+  it('fails before delivering when the trusted working-directory fence changes', async () => {
+    const send = vi.fn();
+    const ds = existingDs({ worker: { killed: false, send } as any });
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+    const res = await triggerSessionTurn(request(), {
+      larkAppId: APP,
+      activeSessions,
+      verifyWorkingDir: () => { throw new Error('replaced'); },
+    });
+
+    expect(res).toMatchObject({ ok: false, errorCode: 'trigger_failed' });
+    expect(send).not.toHaveBeenCalled();
+    expect(mockForkWorker).not.toHaveBeenCalled();
+  });
+
   it('keeps external-event wrappers hidden on a live clean Codex App turn', async () => {
     mockGetBot.mockReturnValue({
       config: { larkAppId: APP, cliId: 'codex-app', codexAppCleanInput: true, workingDir: '/tmp' },

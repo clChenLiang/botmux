@@ -1,8 +1,8 @@
-import { isAbsolute, relative, resolve } from 'node:path';
+import { lstatSync, realpathSync } from 'node:fs';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 
 import {
   TASK_ALLOW_ACTION,
-  TASK_DISCUSS_ACTION,
   TASK_FEEDBACK_ACTION,
 } from '../im/lark/task-action-card.js';
 import type { TaskActionTriggerRequest } from '../im/lark/task-action-card-handler.js';
@@ -10,6 +10,10 @@ import type {
   TaskActionDispatchAcknowledgementRequest,
   TaskActionDispatchAcknowledgementResult,
 } from './task-action-sink.js';
+import type {
+  TaskActionStartLedger,
+  TaskActionStartReceipt,
+} from './task-action-start-ledger.js';
 
 export interface TaskCandidateRecord {
   candidateId: string;
@@ -33,14 +37,19 @@ export interface TaskActionStartRequest {
   operatorOpenId: string;
   idempotencyKey: string;
   dispatchToken: string;
+  /** Re-check immediately before the side effect to close path replacement races. */
+  verifyWorkdir?: () => void;
 }
 
 export interface TaskActionDispatchDeps {
   repoRoot: string;
-  repositories: Readonly<Record<string, string>>;
+  repositories: Readonly<Record<string, string | readonly string[]>>;
   resolveCandidate: (candidateId: string) => TaskCandidateRecord | undefined
     | Promise<TaskCandidateRecord | undefined>;
-  start: (request: TaskActionStartRequest) => void | Promise<void>;
+  start: (request: TaskActionStartRequest, verifyWorkdir?: () => void) => TaskActionStartReceipt
+    | Promise<TaskActionStartReceipt>;
+  startLedger: TaskActionStartLedger;
+  hasActiveSession?: (sessionId: string) => boolean | Promise<boolean>;
   acknowledge: (
     request: TaskActionDispatchAcknowledgementRequest,
   ) => TaskActionDispatchAcknowledgementResult | Promise<TaskActionDispatchAcknowledgementResult>;
@@ -77,8 +86,17 @@ export function createTaskActionDispatch(
 async function dispatchOne(
   request: TaskActionTriggerRequest,
   deps: TaskActionDispatchDeps,
-  repoRoot: string,
+  repoRoot: DirectoryIdentity,
 ): Promise<void> {
+  const previous = deps.startLedger.inspect(request.idempotencyKey);
+  if (previous.state === 'started') {
+    await acknowledge(request, deps);
+    return;
+  }
+  if (previous.state === 'uncertain') {
+    throw new TaskActionDispatchError('task action start outcome is uncertain');
+  }
+
   let candidate: TaskCandidateRecord | undefined;
   try {
     candidate = await deps.resolveCandidate(request.candidateId);
@@ -88,12 +106,9 @@ async function dispatchOne(
 
   let start: TaskActionStartRequest;
   if (!candidate) {
-    if (request.action !== TASK_DISCUSS_ACTION) {
-      throw new TaskActionDispatchError('unknown task candidate');
-    }
     start = {
       candidateId: request.candidateId,
-      prompt: `讨论候选任务 ${request.candidateId}（候选详情暂不可用）`,
+      prompt: `候选详情暂不可用，且仓库无法确认。请讨论并确认任务 ${request.candidateId} 的目标仓库后再开始。`,
       mode: 'discussion',
       operatorOpenId: request.operatorOpenId,
       idempotencyKey: request.idempotencyKey,
@@ -113,23 +128,63 @@ async function dispatchOne(
     };
     if (request.action === TASK_ALLOW_ACTION) {
       const workdir = mappedWorkdir(repoRoot, deps.repositories, candidate.repositoryId);
-      if (!workdir) throw new TaskActionDispatchError('repository mapping unavailable');
-      start = { ...common, mode: 'work', workdir, sessionId: undefined };
+      start = workdir
+        ? {
+            ...common,
+            mode: 'work',
+            workdir: workdir.path,
+            verifyWorkdir: () => verifyWorkdir(workdir),
+            sessionId: undefined,
+          }
+        : {
+            candidateId: candidate.candidateId,
+            prompt: `仓库映射缺失或不唯一。请讨论并确认任务 ${candidate.candidateId} 的目标仓库后再开始。`,
+            mode: 'discussion',
+            operatorOpenId: request.operatorOpenId,
+            idempotencyKey: request.idempotencyKey,
+            dispatchToken: request.dispatchToken,
+          };
     } else if (request.action === TASK_FEEDBACK_ACTION) {
-      if (!candidate.originalSessionId) {
-        throw new TaskActionDispatchError('original task session unavailable');
-      }
-      start = { ...common, mode: 'feedback', sessionId: candidate.originalSessionId };
+      const active = candidate.originalSessionId
+        ? await deps.hasActiveSession?.(candidate.originalSessionId) ?? true
+        : false;
+      start = active
+        ? { ...common, mode: 'feedback', sessionId: candidate.originalSessionId }
+        : { ...common, mode: 'feedback' };
     } else {
       start = { ...common, mode: 'discussion' };
     }
   }
 
+  const claim = deps.startLedger.begin(request.idempotencyKey, request.dispatchToken);
+  if (claim.state === 'started') {
+    await acknowledge(request, deps);
+    return;
+  }
+  if (claim.state !== 'acquired') {
+    throw new TaskActionDispatchError('task action start outcome is uncertain');
+  }
+
+  const { verifyWorkdir: verify, ...startRequest } = start;
+  verify?.();
+  let receipt: TaskActionStartReceipt;
   try {
-    await deps.start(start);
+    receipt = await deps.start(startRequest, verify);
   } catch {
     throw new TaskActionDispatchError('task action dispatch failed');
   }
+  try {
+    deps.startLedger.complete(request.idempotencyKey, request.dispatchToken, receipt);
+  } catch {
+    throw new TaskActionDispatchError('task action start recording failed');
+  }
+  await acknowledge(request, deps);
+}
+
+async function acknowledge(
+  request: TaskActionTriggerRequest,
+  deps: TaskActionDispatchDeps,
+): Promise<void> {
   try {
     await deps.acknowledge({
       idempotencyKey: request.idempotencyKey,
@@ -140,26 +195,84 @@ async function dispatchOne(
   }
 }
 
-function canonicalRoot(value: string): string {
+type DirectoryIdentity = {
+  path: string;
+  realPath: string;
+  device: number | bigint;
+  inode: number | bigint;
+};
+
+type WorkdirIdentity = DirectoryIdentity & { root: DirectoryIdentity };
+
+function canonicalRoot(value: string): DirectoryIdentity {
   if (typeof value !== 'string' || !isAbsolute(value)) {
     throw new TaskActionDispatchError('invalid repository root');
   }
-  return resolve(value);
+  try {
+    const path = resolve(value);
+    const realPath = realpathSync(path);
+    const stat = lstatSync(realPath, { bigint: true });
+    if (!stat.isDirectory()) throw new Error('not directory');
+    return { path, realPath, device: stat.dev, inode: stat.ino };
+  } catch {
+    throw new TaskActionDispatchError('invalid repository root');
+  }
 }
 
 function mappedWorkdir(
-  repoRoot: string,
-  repositories: Readonly<Record<string, string>>,
+  repoRoot: DirectoryIdentity,
+  repositories: Readonly<Record<string, string | readonly string[]>>,
   repositoryId: string,
-): string | undefined {
-  const configured = repositories[repositoryId];
+): WorkdirIdentity | undefined {
+  const mapping = repositories[repositoryId];
+  const configured = Array.isArray(mapping) ? (mapping.length === 1 ? mapping[0] : undefined) : mapping;
   if (typeof configured !== 'string' || configured.length === 0 || isAbsolute(configured)) return undefined;
-  const workdir = resolve(repoRoot, configured);
-  const child = relative(repoRoot, workdir);
+  const workdir = resolve(repoRoot.realPath, configured);
+  const child = relative(repoRoot.realPath, workdir);
   if (!child || child === '..' || child.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) || isAbsolute(child)) {
     return undefined;
   }
-  return workdir;
+  try {
+    assertNoSymlinkSegments(repoRoot.realPath, child);
+    const realPath = realpathSync(workdir);
+    if (!isConfined(repoRoot.realPath, realPath)) return undefined;
+    const stat = lstatSync(realPath, { bigint: true });
+    if (!stat.isDirectory()) return undefined;
+    return { path: workdir, realPath, device: stat.dev, inode: stat.ino, root: repoRoot };
+  } catch {
+    return undefined;
+  }
+}
+
+function verifyWorkdir(identity: WorkdirIdentity): void {
+  try {
+    const rootStat = lstatSync(realpathSync(identity.root.path), { bigint: true });
+    if (rootStat.dev !== identity.root.device || rootStat.ino !== identity.root.inode) throw new Error();
+    const child = relative(identity.root.realPath, identity.path);
+    assertNoSymlinkSegments(identity.root.realPath, child);
+    const realPath = realpathSync(identity.path);
+    const stat = lstatSync(realPath, { bigint: true });
+    if (realPath !== identity.realPath
+      || stat.dev !== identity.device
+      || stat.ino !== identity.inode
+      || !stat.isDirectory()
+      || !isConfined(identity.root.realPath, realPath)) throw new Error();
+  } catch {
+    throw new TaskActionDispatchError('repository path changed before start');
+  }
+}
+
+function assertNoSymlinkSegments(root: string, child: string): void {
+  let current = root;
+  for (const segment of child.split(sep).filter(Boolean)) {
+    current = resolve(current, segment);
+    if (lstatSync(current).isSymbolicLink()) throw new Error('symlink repository path');
+  }
+}
+
+function isConfined(root: string, child: string): boolean {
+  const rel = relative(root, child);
+  return !!rel && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
 function validateCandidate(candidate: TaskCandidateRecord, expectedId: string): void {
@@ -171,4 +284,3 @@ function validateCandidate(candidate: TaskCandidateRecord, expectedId: string): 
     throw new TaskActionDispatchError('invalid task candidate');
   }
 }
-

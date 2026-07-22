@@ -13,6 +13,10 @@ import type {
   TaskActionDispatchAcknowledgementRequest,
   TaskActionDispatchAcknowledgementResult,
 } from './task-action-sink.js';
+import type {
+  TaskActionStartLedger,
+  TaskActionStartReceipt,
+} from './task-action-start-ledger.js';
 
 export interface TaskActionTurnRequest {
   chatId?: string;
@@ -25,19 +29,23 @@ export interface TaskActionTurnRequest {
   candidateId: string;
   dedupKey: string;
   dispatchToken: string;
+  verifyWorkingDir?: () => void;
 }
 
 export interface TaskActionRuntimeConfig {
   ownerOpenId: string;
   repoRoot: string;
-  repositories: Readonly<Record<string, string>>;
+  repositories: Readonly<Record<string, string | readonly string[]>>;
   fallbackChatId: string;
   resolveCandidate: TaskActionDispatchDeps['resolveCandidate'];
+  startLedger: TaskActionStartLedger;
+  hasActiveSession: (sessionId: string) => boolean | Promise<boolean>;
   persist: (request: TaskActionPersistenceRequest) => Promise<TaskActionPersistenceResult>;
   acknowledge: (
     request: TaskActionDispatchAcknowledgementRequest,
   ) => Promise<TaskActionDispatchAcknowledgementResult>;
-  startTurn: (request: TaskActionTurnRequest) => void | Promise<void>;
+  startTurn: (request: TaskActionTurnRequest) => void | TaskActionStartReceipt
+    | Promise<void | TaskActionStartReceipt>;
 }
 
 export interface TaskActionRuntime {
@@ -51,11 +59,13 @@ export function createTaskActionRuntime(config: TaskActionRuntimeConfig): TaskAc
     repoRoot: config.repoRoot,
     repositories: config.repositories,
     resolveCandidate: config.resolveCandidate,
+    startLedger: config.startLedger,
+    hasActiveSession: config.hasActiveSession,
     acknowledge: config.acknowledge,
-    start: async (request) => {
+    start: async (request, verifyWorkingDir) => {
       const chatId = request.chatId ?? config.fallbackChatId;
       if (!chatId && !request.sessionId) throw new Error('task discussion target unavailable');
-      await config.startTurn({
+      const receipt = await config.startTurn({
         chatId: request.sessionId ? undefined : chatId,
         rootMessageId: request.sessionId ? undefined : request.rootMessageId,
         sessionId: request.sessionId,
@@ -66,7 +76,9 @@ export function createTaskActionRuntime(config: TaskActionRuntimeConfig): TaskAc
         candidateId: request.candidateId,
         dedupKey: request.idempotencyKey,
         dispatchToken: request.dispatchToken,
+        verifyWorkingDir,
       });
+      return receipt ?? {};
     },
   });
   return {

@@ -217,6 +217,7 @@ import { createGroupWithBots } from './services/group-creator.js';
 import { createTaskActionSink, createTaskActionDispatchAcknowledger, createTaskActionReconciler } from './services/task-action-sink.js';
 import { createTaskCandidateRegistry } from './services/task-candidate-registry.js';
 import { createTaskActionRuntime, type TaskActionRuntime } from './services/task-action-runtime.js';
+import { createTaskActionStartLedger } from './services/task-action-start-ledger.js';
 import { addBotToChat, isInChat } from './services/groups-store.js';
 import { setChatReplyMode } from './services/chat-reply-mode-store.js';
 import {
@@ -2528,7 +2529,8 @@ function configuredTaskActionRuntime(larkAppId: string): TaskActionRuntime | und
     }
     const parsed = JSON.parse(repositoriesJson) as unknown;
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
-      || Object.values(parsed).some((value) => typeof value !== 'string')) {
+      || Object.values(parsed).some((value) => typeof value !== 'string'
+        && !(Array.isArray(value) && value.every((item) => typeof item === 'string')))) {
       throw new Error('repository map is invalid');
     }
     const ownerOpenId = getOwnerOpenId(configuredAppId);
@@ -2538,12 +2540,22 @@ function configuredTaskActionRuntime(larkAppId: string): TaskActionRuntime | und
       || join(config.session.dataDir, 'task-candidates.json');
     if (!isAbsolute(registryPath)) throw new Error('candidate registry path must be absolute');
     const registry = createTaskCandidateRegistry(registryPath);
+    const startLedgerPath = process.env.BOTMUX_TASK_START_LEDGER?.trim()
+      || join(config.session.dataDir, 'task-action-starts.sqlite');
+    if (!isAbsolute(startLedgerPath)) throw new Error('task start ledger path must be absolute');
     const runtime = createTaskActionRuntime({
       ownerOpenId,
       repoRoot,
-      repositories: parsed as Record<string, string>,
+      repositories: parsed as Record<string, string | string[]>,
       fallbackChatId,
       resolveCandidate: (candidateId) => registry.resolve(candidateId),
+      startLedger: createTaskActionStartLedger(startLedgerPath),
+      hasActiveSession: (sessionId) => {
+        for (const session of activeSessions.values()) {
+          if (session.session.sessionId === sessionId) return true;
+        }
+        return false;
+      },
       persist: createTaskActionSink(sinkConfig),
       acknowledge: createTaskActionDispatchAcknowledger(sinkConfig),
       startTurn: async (request) => {
@@ -2577,8 +2589,13 @@ function configuredTaskActionRuntime(larkAppId: string): TaskActionRuntime | und
           larkAppId: configuredAppId,
           activeSessions,
           workingDirOverride: request.workingDir,
+          verifyWorkingDir: request.verifyWorkingDir,
         });
         if (!response.ok) throw new Error('task turn start failed');
+        return {
+          sessionId: response.target?.sessionId,
+          triggerId: response.triggerId,
+        };
       },
     });
     void createTaskActionReconciler(sinkConfig)().then((result) => {

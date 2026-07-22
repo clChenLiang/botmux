@@ -21,6 +21,8 @@ export interface TriggerSessionDeps {
   activeSessions: Map<string, DaemonSession>;
   /** Trusted daemon-only override. Never populate this from webhook/card data. */
   workingDirOverride?: string;
+  /** Trusted repository identity fence, evaluated again after async routing. */
+  verifyWorkingDir?: () => void;
 }
 
 function triggerTitle(req: TriggerRequest): string {
@@ -308,6 +310,12 @@ export async function triggerSessionTurn(
     }
   }
 
+  try {
+    deps.verifyWorkingDir?.();
+  } catch {
+    return { ok: false, errorCode: 'trigger_failed', error: 'trusted working directory changed' };
+  }
+
   if (dryRun) {
     return {
       ok: true,
@@ -425,6 +433,11 @@ export async function triggerSessionTurn(
   const chatMode: ChatMode = isHttpVirtualSession
     ? 'group'
     : await getChatMode(larkAppId, chatId, { forceRefresh: true });
+  try {
+    deps.verifyWorkingDir?.();
+  } catch {
+    return { ok: false, errorCode: 'trigger_failed', error: 'trusted working directory changed' };
+  }
   let scope: 'thread' | 'chat' = rootMessageId ? 'thread' : 'chat';
   let anchor = rootMessageId || chatId;
   const shouldOpenOwnTopic = !rootMessageId
@@ -433,6 +446,11 @@ export async function triggerSessionTurn(
   if (shouldOpenOwnTopic) {
     anchor = await sendMessage(larkAppId, chatId, t('trigger.external_event', { source: req.envelope.sourceName }, localeForBot(larkAppId)));
     scope = 'thread';
+  }
+  try {
+    deps.verifyWorkingDir?.();
+  } catch {
+    return { ok: false, errorCode: 'trigger_failed', error: 'trusted working directory changed' };
   }
 
   const session = sessionStore.createSession(chatId, anchor, triggerTitle(req), 'group');
@@ -521,6 +539,11 @@ export async function triggerSessionTurn(
       codexAppMessageContext,
     },
   );
+  try {
+    deps.verifyWorkingDir?.();
+  } catch {
+    return { ok: false, errorCode: 'trigger_failed', error: 'trusted working directory changed' };
+  }
   // Register right before the fork branches (no await between here and forkWorker)
   // so a concurrent inbound message can't observe this session worker-less and
   // race a duplicate re-fork — the set-and-fork atomicity the original path had.
