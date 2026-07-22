@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { dirname, isAbsolute } from 'node:path';
 
 import {
@@ -20,6 +20,12 @@ export interface TaskActionSinkConfig {
   stateDir: string;
   timeoutMs?: number;
   maxOutputBytes?: number;
+}
+
+export interface TaskActionSinkRuntime {
+  spawn: (command: string, args: string[], options: SpawnOptions) => ChildProcess;
+  killProcess: (pid: number, signal?: NodeJS.Signals | number) => boolean;
+  platform: NodeJS.Platform;
 }
 
 type TaskActionSinkErrorCode =
@@ -68,18 +74,25 @@ const TRIGGER_ACTIONS = new Set<string>([
 type SafeConfig = Required<TaskActionSinkConfig>;
 type PlainRecord = Record<string, unknown>;
 
+const DEFAULT_RUNTIME: TaskActionSinkRuntime = Object.freeze({
+  spawn: (command: string, args: string[], options: SpawnOptions) => spawn(command, args, options),
+  killProcess: (pid: number, signal?: NodeJS.Signals | number) => process.kill(pid, signal),
+  platform: process.platform,
+});
+
 /**
  * Create the narrow process adapter used at the card callback durability
  * boundary. The child receives only explicit argv and a minimal environment.
  */
 export function createTaskActionSink(
   untrustedConfig: TaskActionSinkConfig,
+  runtime: TaskActionSinkRuntime = DEFAULT_RUNTIME,
 ): (request: TaskActionPersistenceRequest) => Promise<TaskActionPersistenceResult> {
   const config = parseConfig(untrustedConfig);
 
   return async (untrustedRequest) => {
     const request = parseRequest(untrustedRequest);
-    const stdout = await invokeTaskOs(config, request);
+    const stdout = await invokeTaskOs(config, request, runtime);
     return parseResult(stdout, request);
   };
 }
@@ -142,6 +155,7 @@ function compatible(action: string, subjectType: unknown): boolean {
 function invokeTaskOs(
   config: SafeConfig,
   request: TaskActionPersistenceRequest,
+  runtime: TaskActionSinkRuntime,
 ): Promise<string> {
   const args = [
     config.taskOsCliPath,
@@ -157,8 +171,8 @@ function invokeTaskOs(
   return new Promise((resolve, reject) => {
     let child: ChildProcess;
     try {
-      child = spawn(config.nodeExecutable, args, {
-        detached: process.platform !== 'win32',
+      child = runtime.spawn(config.nodeExecutable, args, {
+        detached: runtime.platform !== 'win32',
         env: {
           PATH: dirname(config.nodeExecutable),
           LANG: 'C.UTF-8',
@@ -173,55 +187,103 @@ function invokeTaskOs(
       return;
     }
 
+    let settled = false;
     let terminalCode: TaskActionSinkErrorCode | undefined;
     let totalBytes = 0;
     const stdoutChunks: Buffer[] = [];
     let killTimer: NodeJS.Timeout | undefined;
-    const timeout = setTimeout(() => {
-      terminalCode ??= 'ERR_TASK_ACTION_SINK_TIMEOUT';
-      terminate(child);
-      killTimer = setTimeout(() => terminate(child, 'SIGKILL'), KILL_GRACE_MS);
-      killTimer.unref();
-    }, config.timeoutMs);
+    let timeout: NodeJS.Timeout;
 
-    const collect = (chunk: Buffer | string, keep: boolean) => {
+    const collect = (chunk: Buffer | string, keep: boolean): void => {
+      if (settled || terminalCode) return;
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       totalBytes += buffer.byteLength;
       if (totalBytes > config.maxOutputBytes) {
-        terminalCode ??= 'ERR_TASK_ACTION_SINK_OUTPUT';
-        terminate(child);
-        killTimer ??= setTimeout(() => terminate(child, 'SIGKILL'), KILL_GRACE_MS);
-        killTimer.unref();
+        beginTermination('ERR_TASK_ACTION_SINK_OUTPUT');
         return;
       }
       if (keep) stdoutChunks.push(buffer);
     };
 
-    child.stdout!.on('data', (chunk) => collect(chunk, true));
-    child.stderr!.on('data', (chunk) => collect(chunk, false));
-    child.once('error', () => {
-      terminalCode ??= 'ERR_TASK_ACTION_SINK_SPAWN';
-    });
-    child.once('close', (code, signal) => {
-      clearTimeout(timeout);
-      if (killTimer) clearTimeout(killTimer);
+    const onStdout = (chunk: Buffer | string) => collect(chunk, true);
+    const onStderr = (chunk: Buffer | string) => collect(chunk, false);
+    const onError = () => settleError(terminalCode ?? 'ERR_TASK_ACTION_SINK_SPAWN');
+    const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (settled) return;
       if (terminalCode) {
-        reject(new TaskActionSinkError(terminalCode));
+        settleError(terminalCode);
         return;
       }
       if (code !== 0 || signal !== null) {
-        reject(new TaskActionSinkError('ERR_TASK_ACTION_SINK_EXIT'));
+        settleError('ERR_TASK_ACTION_SINK_EXIT');
         return;
       }
+      settleSuccess();
+    };
+
+    function clearTimers(): void {
+      clearTimeout(timeout);
+      if (killTimer) clearTimeout(killTimer);
+    }
+
+    function cleanup(): void {
+      clearTimers();
+      child.stdout?.off('data', onStdout);
+      child.stderr?.off('data', onStderr);
+      child.stdout?.pause();
+      child.stderr?.pause();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.off('error', onError);
+      child.off('close', onClose);
+      // EventEmitter treats an unhandled late `error` as an exception. This
+      // listener is closure-free and makes late child errors harmless.
+      child.on('error', ignoreLateChildError);
+    }
+
+    function settleError(code: TaskActionSinkErrorCode): void {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new TaskActionSinkError(code));
+    }
+
+    function settleSuccess(): void {
+      if (settled) return;
+      settled = true;
+      cleanup();
       resolve(Buffer.concat(stdoutChunks).toString('utf8'));
-    });
+    }
+
+    function beginTermination(code: TaskActionSinkErrorCode): void {
+      if (settled || terminalCode) return;
+      terminalCode = code;
+      terminate(child, 'SIGTERM', runtime);
+      killTimer = setTimeout(() => {
+        if (settled) return;
+        terminate(child, 'SIGKILL', runtime);
+        // On Windows and for uninterruptible Unix children termination is best
+        // effort. The callback boundary must still settle and release streams.
+        settleError(code);
+      }, KILL_GRACE_MS);
+    }
+
+    child.stdout!.on('data', onStdout);
+    child.stderr!.on('data', onStderr);
+    child.once('error', onError);
+    child.once('close', onClose);
+    timeout = setTimeout(() => beginTermination('ERR_TASK_ACTION_SINK_TIMEOUT'), config.timeoutMs);
   });
 }
 
-function terminate(child: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void {
-  if (child.pid && process.platform !== 'win32') {
+function terminate(
+  child: ChildProcess,
+  signal: NodeJS.Signals,
+  runtime: TaskActionSinkRuntime,
+): void {
+  if (child.pid && runtime.platform !== 'win32') {
     try {
-      process.kill(-child.pid, signal);
+      runtime.killProcess(-child.pid, signal);
       return;
     } catch {
       // The group may already be gone; fall back to the direct child.
@@ -233,6 +295,8 @@ function terminate(child: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): voi
     // Process termination is best effort; close/error still settles the call.
   }
 }
+
+function ignoreLateChildError(): void {}
 
 function parseResult(
   stdout: string,

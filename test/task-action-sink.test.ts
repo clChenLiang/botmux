@@ -1,6 +1,9 @@
+import { type ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { PassThrough } from 'node:stream';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -161,6 +164,53 @@ describe('createTaskActionSink', () => {
     expect(String(error)).not.toContain('PRIVATE_OUTPUT');
   });
 
+  it.each(['timeout', 'output'] as const)(
+    'settles a %s failure after the kill grace when a child never closes',
+    async (failure) => {
+      const child = stubbornChild();
+      const signals: Array<NodeJS.Signals | number | undefined> = [];
+      const stubbornSink = createTaskActionSink({
+        nodeExecutable: process.execPath,
+        taskOsCliPath: join(process.cwd(), 'fake-cli.mjs'),
+        stateDir: join(process.cwd(), 'fake-state'),
+        timeoutMs: failure === 'timeout' ? 10 : 2_000,
+        maxOutputBytes: 16,
+      }, {
+        spawn: () => child as ChildProcess,
+        killProcess: (_pid, signal) => {
+          signals.push(signal);
+          throw new Error('PRIVATE UNINTERRUPTIBLE PROCESS');
+        },
+        platform: 'linux',
+      });
+      let settlements = 0;
+      const result = stubbornSink(request()).then(
+        () => { settlements += 1; return undefined; },
+        (error) => { settlements += 1; return error; },
+      );
+      if (failure === 'output') child.stdout.write('PRIVATE_OUTPUT_OVERFLOW');
+
+      const error = await result;
+      expect(error).toMatchObject({
+        code: failure === 'timeout'
+          ? 'ERR_TASK_ACTION_SINK_TIMEOUT'
+          : 'ERR_TASK_ACTION_SINK_OUTPUT',
+      });
+      expect(String(error)).not.toContain('PRIVATE');
+      expect(signals).toEqual(['SIGTERM', 'SIGKILL']);
+      expect(child.killSignals).toEqual(['SIGTERM', 'SIGKILL']);
+      expect(child.stdout.listenerCount('data')).toBe(0);
+      expect(child.stderr.listenerCount('data')).toBe(0);
+      expect(child.stdout.destroyed).toBe(true);
+      expect(child.stderr.destroyed).toBe(true);
+
+      child.emit('error', new Error('PRIVATE LATE ERROR'));
+      child.emit('close', null, 'SIGKILL');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(settlements).toBe(1);
+    },
+  );
+
   it('times out, kills the detached process group, and does not leak output', async () => {
     const { directory, sink } = await fixture('setInterval(() => {}, 1_000);', { timeoutMs: 50 });
     const marker = join(directory, 'started');
@@ -259,4 +309,23 @@ async function waitForProcessExit(pid: number): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error('child process group member remained alive');
+}
+
+function stubbornChild() {
+  const child = new EventEmitter() as EventEmitter & {
+    pid: number;
+    stdout: PassThrough;
+    stderr: PassThrough;
+    killSignals: Array<NodeJS.Signals | number | undefined>;
+    kill: (signal?: NodeJS.Signals | number) => boolean;
+  };
+  child.pid = 424_242;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.killSignals = [];
+  child.kill = (signal) => {
+    child.killSignals.push(signal);
+    return false;
+  };
+  return child;
 }
