@@ -1,0 +1,243 @@
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+
+import { afterEach, describe, expect, it } from 'vitest';
+
+import {
+  createTaskActionSink,
+  TaskActionSinkError,
+} from '../src/services/task-action-sink.js';
+import {
+  MR_IGNORE_ACTION,
+  REPOSITORY_IGNORE_ACTION,
+  TASK_ALLOW_ACTION,
+  TASK_DISCUSS_ACTION,
+  TASK_REJECT_ACTION,
+} from '../src/im/lark/task-action-card.js';
+
+const directories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(directories.splice(0).map((directory) => rm(directory, {
+    recursive: true,
+    force: true,
+  })));
+});
+
+async function fixture(source: string, options: { timeoutMs?: number; maxOutputBytes?: number } = {}) {
+  const directory = await mkdtemp(join(tmpdir(), 'botmux-task-sink-'));
+  directories.push(directory);
+  const cliPath = join(directory, 'task os cli;$(touch SHOULD_NOT_EXIST).mjs');
+  const stateDir = join(directory, 'state dir;$(touch ALSO_NOT_HERE)');
+  await writeFile(cliPath, source, { mode: 0o700 });
+  const sink = createTaskActionSink({
+    nodeExecutable: process.execPath,
+    taskOsCliPath: cliPath,
+    stateDir,
+    timeoutMs: options.timeoutMs ?? 2_000,
+    maxOutputBytes: options.maxOutputBytes ?? 16_384,
+  });
+  return { directory, cliPath, stateDir, sink };
+}
+
+const request = (overrides: Record<string, unknown> = {}) => ({
+  action: TASK_ALLOW_ACTION,
+  subject: { type: 'candidate', id: 'candidate_17' },
+  operatorOpenId: 'ou_owner_17',
+  ...overrides,
+} as any);
+
+function responder(result: unknown, extra = ''): string {
+  return `
+    import { writeFileSync } from 'node:fs';
+    ${extra}
+    process.stdout.write(${JSON.stringify(JSON.stringify(result))});
+  `;
+}
+
+describe('createTaskActionSink', () => {
+  it('uses argv only, includes the exact transaction contract, and sanitizes inherited secrets', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'botmux-task-sink-'));
+    directories.push(directory);
+    const capture = join(directory, 'capture.json');
+    const cliPath = join(directory, 'task os cli;$(touch SHOULD_NOT_EXIST).mjs');
+    const stateDir = join(directory, 'state dir;$(touch ALSO_NOT_HERE)');
+    await writeFile(cliPath, `
+      import { writeFileSync } from 'node:fs';
+      writeFileSync(${JSON.stringify(capture)}, JSON.stringify({ argv: process.argv.slice(2), env: process.env }));
+      process.stdout.write(JSON.stringify({
+        outcome: 'recorded', effectiveAction: 'task_allow',
+        triggerRequired: true, idempotencyKey: 'delivery.candidate_01',
+      }));
+    `);
+    process.env.BOTMUX_PRIVATE_ADAPTER_SECRET = 'DO_NOT_INHERIT_ME';
+    try {
+      const sink = createTaskActionSink({
+        nodeExecutable: process.execPath,
+        taskOsCliPath: cliPath,
+        stateDir,
+      });
+      await expect(sink(request())).resolves.toEqual({
+        outcome: 'recorded',
+        effectiveAction: TASK_ALLOW_ACTION,
+        triggerRequired: true,
+        idempotencyKey: 'delivery.candidate_01',
+      });
+    } finally {
+      delete process.env.BOTMUX_PRIVATE_ADAPTER_SECRET;
+    }
+
+    const captured = JSON.parse(await readFile(capture, 'utf8'));
+    expect(captured.argv).toEqual([
+      'task-action', 'apply',
+      '--state-dir', stateDir,
+      '--action', TASK_ALLOW_ACTION,
+      '--subject-type', 'candidate',
+      '--subject-id', 'candidate_17',
+      '--operator-open-id', 'ou_owner_17',
+      '--json',
+    ]);
+    expect(captured.env.BOTMUX_PRIVATE_ADAPTER_SECRET).toBeUndefined();
+    expect(captured.env).toMatchObject({ LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' });
+    expect(captured.env.PATH).toBe(dirname(process.execPath));
+    await expect(readFile(join(directory, 'SHOULD_NOT_EXIST'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(readFile(join(directory, 'PWNED'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it.each([
+    [{ outcome: 'recorded', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: true, idempotencyKey: 'delivery.c1' }],
+    [{ outcome: 'duplicate', effectiveAction: TASK_DISCUSS_ACTION, triggerRequired: true, idempotencyKey: 'delivery.c2' }],
+    [{ outcome: 'duplicate', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: false }],
+    [{ outcome: 'conflict', effectiveAction: TASK_REJECT_ACTION, triggerRequired: false }],
+    [{ outcome: 'recorded', effectiveAction: MR_IGNORE_ACTION, triggerRequired: false }],
+    [{ outcome: 'recorded', effectiveAction: REPOSITORY_IGNORE_ACTION, triggerRequired: false }],
+  ] as const)('maps an exact durable result %j', async (result) => {
+    const { sink } = await fixture(responder(result));
+    const action = result.outcome === 'conflict' ? TASK_ALLOW_ACTION : result.effectiveAction;
+    const subject = action === MR_IGNORE_ACTION
+      ? { type: 'mr', id: 'mr_17' }
+      : action === REPOSITORY_IGNORE_ACTION
+        ? { type: 'repository', id: 'repo_marketplace' }
+        : { type: 'candidate', id: 'candidate_17' };
+    await expect(sink(request({ action, subject }))).resolves.toEqual(result);
+  });
+
+  it.each([
+    ['', 'empty stdout'],
+    ['not-json PRIVATE_STDOUT', 'malformed JSON'],
+    ['{}', 'missing fields'],
+    [JSON.stringify({ outcome: 'recorded', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: false, extra: true }), 'extra field'],
+    [JSON.stringify({ outcome: 'recorded', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: true }), 'missing key'],
+    [JSON.stringify({ outcome: 'recorded', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: false, idempotencyKey: 'x' }), 'unexpected key'],
+    [JSON.stringify({ outcome: 'recorded', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: true, idempotencyKey: '../unsafe' }), 'unsafe key'],
+    [JSON.stringify({ outcome: 'recorded', effectiveAction: MR_IGNORE_ACTION, triggerRequired: true, idempotencyKey: 'delivery.mr' }), 'invalid trigger action'],
+  ])('rejects %s protocol output without echoing private content (%s)', async (stdout) => {
+    const { sink } = await fixture(`process.stdout.write(${JSON.stringify(stdout)});`);
+    const error = await sink(request()).catch((caught) => caught);
+    expect(error).toBeInstanceOf(TaskActionSinkError);
+    expect(error).toMatchObject({ code: 'ERR_TASK_ACTION_SINK_PROTOCOL' });
+    expect(String(error)).not.toContain('PRIVATE_STDOUT');
+  });
+
+  it('rejects a nonzero exit and redacts stdout, stderr, and exit details', async () => {
+    const { sink } = await fixture(`
+      process.stdout.write('PRIVATE_STDOUT');
+      process.stderr.write('PRIVATE_STDERR');
+      process.exit(37);
+    `);
+    const error = await sink(request()).catch((caught) => caught);
+    expect(error).toMatchObject({ code: 'ERR_TASK_ACTION_SINK_EXIT' });
+    expect(String(error)).not.toMatch(/PRIVATE|37/);
+  });
+
+  it('bounds aggregate output and returns a stable redacted error', async () => {
+    const { sink } = await fixture(`
+      process.stdout.write('PRIVATE_OUTPUT'.repeat(200));
+      setInterval(() => {}, 1_000);
+    `, { maxOutputBytes: 128 });
+    const error = await sink(request()).catch((caught) => caught);
+    expect(error).toMatchObject({ code: 'ERR_TASK_ACTION_SINK_OUTPUT' });
+    expect(String(error)).not.toContain('PRIVATE_OUTPUT');
+  });
+
+  it('times out, kills the detached process group, and does not leak output', async () => {
+    const { directory, sink } = await fixture('setInterval(() => {}, 1_000);', { timeoutMs: 50 });
+    const marker = join(directory, 'started');
+    const pidFile = join(directory, 'child.pid');
+    await writeFile(join(directory, 'task os cli;$(touch SHOULD_NOT_EXIST).mjs'), `
+      import { spawn } from 'node:child_process';
+      import { writeFileSync } from 'node:fs';
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)']);
+      writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));
+      writeFileSync(${JSON.stringify(marker)}, 'yes');
+      process.stderr.write('PRIVATE_TIMEOUT');
+      setInterval(() => {}, 1_000);
+    `);
+    const error = await sink(request()).catch((caught) => caught);
+    expect(error).toMatchObject({ code: 'ERR_TASK_ACTION_SINK_TIMEOUT' });
+    expect(String(error)).not.toContain('PRIVATE_TIMEOUT');
+    expect(await readFile(marker, 'utf8')).toBe('yes');
+    const childPid = Number(await readFile(pidFile, 'utf8'));
+    await expect(waitForProcessExit(childPid)).resolves.toBeUndefined();
+  });
+
+  it('maps spawn failures to a stable private error', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'botmux-task-sink-'));
+    directories.push(directory);
+    const sink = createTaskActionSink({
+      nodeExecutable: join(directory, 'missing-node'),
+      taskOsCliPath: join(directory, 'missing-cli.mjs'),
+      stateDir: join(directory, 'state'),
+    });
+    const error = await sink(request()).catch((caught) => caught);
+    expect(error).toMatchObject({ code: 'ERR_TASK_ACTION_SINK_SPAWN' });
+    expect(String(error)).not.toContain(directory);
+  });
+
+  it.each([
+    [{ nodeExecutable: 'node', taskOsCliPath: '/cli.mjs', stateDir: '/state' }, 'relative executable'],
+    [{ nodeExecutable: process.execPath, taskOsCliPath: 'cli.mjs', stateDir: '/state' }, 'relative CLI'],
+    [{ nodeExecutable: process.execPath, taskOsCliPath: '/cli.mjs', stateDir: 'state' }, 'relative state'],
+    [{ nodeExecutable: process.execPath, taskOsCliPath: '/cli.mjs', stateDir: '/state', extra: true }, 'extra key'],
+    [Object.defineProperty({}, 'nodeExecutable', { get() { throw new Error('PRIVATE_GETTER'); } }), 'accessor'],
+    [new Proxy({}, { ownKeys() { throw new Error('PRIVATE_PROXY'); } }), 'proxy'],
+  ])('rejects an unsafe configuration', (config) => {
+    expect(() => createTaskActionSink(config as any)).toThrowError(TaskActionSinkError);
+    try {
+      createTaskActionSink(config as any);
+    } catch (error) {
+      expect(error).toMatchObject({ code: 'ERR_TASK_ACTION_SINK_CONFIG' });
+      expect(String(error)).not.toMatch(/PRIVATE|nodeExecutable|taskOsCliPath/);
+    }
+  });
+
+  it.each([
+    [{ ...request(), extra: true }, 'extra request key'],
+    [{ ...request(), subject: { type: 'candidate', id: 'c1', extra: true } }, 'extra subject key'],
+    [Object.defineProperty({}, 'action', { get() { throw new Error('PRIVATE_REQUEST'); } }), 'accessor request'],
+    [new Proxy({}, { ownKeys() { throw new Error('PRIVATE_REQUEST_PROXY'); } }), 'proxy request'],
+    [request({ action: MR_IGNORE_ACTION, subject: { type: 'candidate', id: 'c1' } }), 'action/subject mismatch'],
+  ])('rejects unsafe input', async (input) => {
+    const { sink } = await fixture(responder({
+      outcome: 'recorded', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: false,
+    }));
+    const error = await sink(input as any).catch((caught) => caught);
+    expect(error).toMatchObject({ code: 'ERR_TASK_ACTION_SINK_INPUT' });
+    expect(String(error)).not.toContain('PRIVATE_REQUEST');
+  });
+});
+
+async function waitForProcessExit(pid: number): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return;
+      throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error('child process group member remained alive');
+}
