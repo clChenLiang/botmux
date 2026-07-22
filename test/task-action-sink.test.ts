@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   createTaskActionDispatchAcknowledger,
+  createTaskActionReconciler,
   createTaskActionSink,
   TaskActionSinkError,
 } from '../src/services/task-action-sink.js';
@@ -62,6 +63,16 @@ function responder(result: unknown, extra = ''): string {
 }
 
 describe('createTaskActionSink', () => {
+  it('runs the narrow startup reconcile contract without exposing payloads', async () => {
+    const result = { eligible: 1, created: 1, existing: 0, items: [
+      { candidateId: 'candidate_17', action: TASK_ALLOW_ACTION,
+        idempotencyKey: 'action:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        state: 'pending' },
+    ] };
+    const { config } = await fixture(responder(result));
+    const reconcile = createTaskActionReconciler(config);
+    await expect(reconcile()).resolves.toEqual(result);
+  });
   it('uses argv only, includes the exact transaction contract, and sanitizes inherited secrets', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'botmux-task-sink-'));
     directories.push(directory);

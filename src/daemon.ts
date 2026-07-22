@@ -2,7 +2,7 @@ import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { join, dirname } from 'node:path';
+import { isAbsolute, join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
@@ -214,6 +214,9 @@ import {
   RealtimeVoiceSession,
 } from './vc-agent/realtime/index.js';
 import { createGroupWithBots } from './services/group-creator.js';
+import { createTaskActionSink, createTaskActionDispatchAcknowledger, createTaskActionReconciler } from './services/task-action-sink.js';
+import { createTaskCandidateRegistry } from './services/task-candidate-registry.js';
+import { createTaskActionRuntime, type TaskActionRuntime } from './services/task-action-runtime.js';
 import { addBotToChat, isInChat } from './services/groups-store.js';
 import { setChatReplyMode } from './services/chat-reply-mode-store.js';
 import {
@@ -2493,10 +2496,113 @@ const v3GateRunner = createV3GateRunner({
   },
 });
 
+let taskActionRuntimeCache: { larkAppId: string; runtime: TaskActionRuntime } | null | undefined;
+
+/** Lazily enable task automation for exactly one configured bot. Any missing or
+ * malformed setting disables only this namespace; the daemon's other features
+ * remain available. */
+function configuredTaskActionRuntime(larkAppId: string): TaskActionRuntime | undefined {
+  if (taskActionRuntimeCache !== undefined) {
+    return taskActionRuntimeCache?.larkAppId === larkAppId
+      ? taskActionRuntimeCache.runtime
+      : undefined;
+  }
+  const configuredAppId = process.env.BOTMUX_TASK_ACTION_LARK_APP_ID?.trim();
+  const nodeExecutable = process.env.BOTMUX_TASK_OS_NODE?.trim();
+  const taskOsCliPath = process.env.BOTMUX_TASK_OS_CLI?.trim();
+  const stateDir = process.env.BOTMUX_TASK_OS_STATE_DIR?.trim();
+  const repoRoot = process.env.BOTMUX_TASK_REPO_ROOT?.trim();
+  const fallbackChatId = process.env.BOTMUX_TASK_ACTION_CHAT_ID?.trim();
+  const repositoriesJson = process.env.BOTMUX_TASK_REPOSITORIES_JSON?.trim();
+  if (!configuredAppId && !nodeExecutable && !taskOsCliPath && !stateDir
+    && !repoRoot && !fallbackChatId && !repositoriesJson) {
+    taskActionRuntimeCache = null;
+    return undefined;
+  }
+  try {
+    if (!configuredAppId || !nodeExecutable || !taskOsCliPath || !stateDir
+      || !repoRoot || !fallbackChatId || !repositoriesJson
+      || !isAbsolute(nodeExecutable) || !isAbsolute(taskOsCliPath)
+      || !isAbsolute(stateDir) || !isAbsolute(repoRoot)) {
+      throw new Error('required task automation environment is incomplete');
+    }
+    const parsed = JSON.parse(repositoriesJson) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+      || Object.values(parsed).some((value) => typeof value !== 'string')) {
+      throw new Error('repository map is invalid');
+    }
+    const ownerOpenId = getOwnerOpenId(configuredAppId);
+    if (!ownerOpenId) throw new Error('configured bot owner is unavailable');
+    const sinkConfig = { nodeExecutable, taskOsCliPath, stateDir };
+    const registryPath = process.env.BOTMUX_TASK_CANDIDATE_REGISTRY?.trim()
+      || join(config.session.dataDir, 'task-candidates.json');
+    if (!isAbsolute(registryPath)) throw new Error('candidate registry path must be absolute');
+    const registry = createTaskCandidateRegistry(registryPath);
+    const runtime = createTaskActionRuntime({
+      ownerOpenId,
+      repoRoot,
+      repositories: parsed as Record<string, string>,
+      fallbackChatId,
+      resolveCandidate: (candidateId) => registry.resolve(candidateId),
+      persist: createTaskActionSink(sinkConfig),
+      acknowledge: createTaskActionDispatchAcknowledger(sinkConfig),
+      startTurn: async (request) => {
+        const response = await triggerSessionTurn({
+          source: {
+            type: 'schedule',
+            connectorId: 'task-action',
+            requestId: request.dedupKey,
+          },
+          target: {
+            kind: 'turn',
+            botId: configuredAppId,
+            chatId: request.chatId,
+            rootMessageId: request.rootMessageId,
+            sessionId: request.sessionId,
+          },
+          envelope: {
+            format: 'botmux.task-action.v1',
+            sourceName: `Task ${request.candidateId}`,
+            trusted: false,
+            payload: {
+              candidateId: request.candidateId,
+              sourceRef: request.sourceRef,
+              mode: request.mode,
+              dispatchToken: request.dispatchToken,
+            },
+          },
+          instruction: request.instruction,
+          options: { dedupKey: request.dedupKey, asyncReturnSessionId: true },
+        }, {
+          larkAppId: configuredAppId,
+          activeSessions,
+          workingDirOverride: request.workingDir,
+        });
+        if (!response.ok) throw new Error('task turn start failed');
+      },
+    });
+    void createTaskActionReconciler(sinkConfig)().then((result) => {
+      if (result.created > 0) {
+        logger.info(`[task-action] reconciled ${result.created} orphan trigger(s); Task OS recovery can reclaim them`);
+      }
+    }).catch(() => {
+      logger.warn('[task-action] startup reconcile failed; durable state remains retryable');
+    });
+    taskActionRuntimeCache = { larkAppId: configuredAppId, runtime };
+  } catch (error) {
+    logger.error(`[task-action] disabled: ${error instanceof Error ? error.message : 'invalid configuration'}`);
+    taskActionRuntimeCache = null;
+  }
+  return taskActionRuntimeCache?.larkAppId === larkAppId
+    ? taskActionRuntimeCache.runtime
+    : undefined;
+}
+
 const cardDeps: CardHandlerDeps = {
   activeSessions,
   sessionReply,
   lastRepoScan,
+  taskActionDeps: (larkAppId) => configuredTaskActionRuntime(larkAppId)?.handlerDeps,
   workflowApprovalResolved: (runId) => {
     driveWorkflowRun(runId).catch((err) => {
       logger.warn(`[workflow:${runId}] re-entry after approval failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -8576,6 +8682,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
 
     checkAllowedChatGroupsConfig(bot);
+    // Initializes the configured task bot after allowedUsers have been
+    // resolved to this app's platform open_id, and runs startup reconcile.
+    configuredTaskActionRuntime(cfg.larkAppId);
 
     // Probe bot open_id and persist to bots-info.json. When the friendly
     // botName comes back from /bot/v3/info, refresh the dashboard descriptor

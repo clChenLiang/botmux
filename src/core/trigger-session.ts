@@ -7,7 +7,7 @@ import { getChatMode, getMessageChatId, sendMessage, replyMessage, type ChatMode
 import { resolveRegularGroupMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
-import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
+import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, getSessionWorkingDir, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
 import { forkWorker, getCurrentCliVersion, sendWorkerInput } from './worker-pool.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
@@ -19,6 +19,8 @@ import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.
 export interface TriggerSessionDeps {
   larkAppId: string;
   activeSessions: Map<string, DaemonSession>;
+  /** Trusted daemon-only override. Never populate this from webhook/card data. */
+  workingDirOverride?: string;
 }
 
 function triggerTitle(req: TriggerRequest): string {
@@ -291,6 +293,21 @@ export async function triggerSessionTurn(
     ds = deps.activeSessions.get(sessionKey(chatId, larkAppId));
   }
 
+  if (deps.workingDirOverride && ds) {
+    const trustedDir = validateWorkingDir(deps.workingDirOverride, localeForBot(larkAppId));
+    if (!trustedDir.ok) {
+      return { ok: false, errorCode: 'trigger_failed', error: trustedDir.error };
+    }
+    const existingDir = validateWorkingDir(getSessionWorkingDir(ds), localeForBot(larkAppId));
+    if (!existingDir.ok || existingDir.resolvedPath !== trustedDir.resolvedPath) {
+      return {
+        ok: false,
+        errorCode: 'trigger_failed',
+        error: 'existing session is bound to a different working directory',
+      };
+    }
+  }
+
   if (dryRun) {
     return {
       ok: true,
@@ -392,7 +409,14 @@ export async function triggerSessionTurn(
     };
   }
 
-  const wd = resolveWorkingDir(larkAppId, chatId);
+  const wd = deps.workingDirOverride
+    ? (() => {
+        const validated = validateWorkingDir(deps.workingDirOverride!, localeForBot(larkAppId));
+        return validated.ok
+          ? { ok: true as const, workingDir: validated.resolvedPath, fromBotDefault: false }
+          : { ok: false as const, error: validated.error };
+      })()
+    : resolveWorkingDir(larkAppId, chatId);
   if (!wd.ok) {
     return { ok: false, errorCode: 'trigger_failed', error: wd.error };
   }

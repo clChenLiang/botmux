@@ -38,6 +38,18 @@ export interface TaskActionDispatchAcknowledgementResult {
   idempotencyKey: string;
 }
 
+export interface TaskActionReconcileResult {
+  eligible: number;
+  created: number;
+  existing: number;
+  items: Array<{
+    candidateId: string;
+    action: typeof TASK_ALLOW_ACTION | typeof TASK_DISCUSS_ACTION;
+    idempotencyKey: string;
+    state: string;
+  }>;
+}
+
 type TaskActionSinkErrorCode =
   | 'ERR_TASK_ACTION_SINK_CONFIG'
   | 'ERR_TASK_ACTION_SINK_INPUT'
@@ -134,6 +146,19 @@ export function createTaskActionDispatchAcknowledger(
     ], runtime);
     return parseAcknowledgementResult(stdout, request);
   };
+}
+
+/** Materialize any decision-before-outbox crash at daemon startup. Claiming
+ * remains Task OS's responsibility; recovered claims re-enter through the
+ * same exported trigger dependency. */
+export function createTaskActionReconciler(
+  untrustedConfig: TaskActionSinkConfig,
+  runtime: TaskActionSinkRuntime = DEFAULT_RUNTIME,
+): () => Promise<TaskActionReconcileResult> {
+  const config = parseConfig(untrustedConfig);
+  return async () => parseReconcileResult(await invokeTaskOs(config, [
+    'task-action', 'reconcile', '--state-dir', config.stateDir, '--json',
+  ], runtime));
 }
 
 function parseConfig(value: unknown): SafeConfig {
@@ -412,6 +437,45 @@ function parseAcknowledgementResult(
       throw new Error('mismatched acknowledgement');
     }
     return { outcome: data.outcome, idempotencyKey: data.idempotencyKey };
+  } catch {
+    throw new TaskActionSinkError('ERR_TASK_ACTION_SINK_PROTOCOL');
+  }
+}
+
+function parseReconcileResult(stdout: string): TaskActionReconcileResult {
+  try {
+    const parsed: unknown = JSON.parse(stdout);
+    const data = exactDataRecord(parsed, ['eligible', 'created', 'existing', 'items'], [
+      'eligible', 'created', 'existing', 'items',
+    ]);
+    if (![data.eligible, data.created, data.existing].every((value) =>
+      Number.isSafeInteger(value) && (value as number) >= 0)) throw new Error('invalid count');
+    if ((data.created as number) + (data.existing as number) !== data.eligible
+      || !Array.isArray(data.items) || data.items.length !== data.eligible) {
+      throw new Error('invalid reconcile totals');
+    }
+    const items = data.items.map((item) => {
+      const row = exactDataRecord(item, ['candidateId', 'action', 'idempotencyKey', 'state'], [
+        'candidateId', 'action', 'idempotencyKey', 'state',
+      ]);
+      if (!isOpaqueId(row.candidateId) || !isOpaqueId(row.idempotencyKey)
+        || (row.action !== TASK_ALLOW_ACTION && row.action !== TASK_DISCUSS_ACTION)
+        || typeof row.state !== 'string' || row.state.length === 0 || row.state.length > 32) {
+        throw new Error('invalid reconcile item');
+      }
+      return {
+        candidateId: row.candidateId,
+        action: row.action,
+        idempotencyKey: row.idempotencyKey,
+        state: row.state,
+      };
+    });
+    return {
+      eligible: data.eligible as number,
+      created: data.created as number,
+      existing: data.existing as number,
+      items,
+    };
   } catch {
     throw new TaskActionSinkError('ERR_TASK_ACTION_SINK_PROTOCOL');
   }

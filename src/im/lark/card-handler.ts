@@ -76,6 +76,19 @@ import {
   openLocalCliInIterm,
   preflightLocalCliOpen,
 } from '../../services/local-cli-opener.js';
+import {
+  handleTaskActionCard,
+  type TaskActionHandlerDeps,
+} from './task-action-card-handler.js';
+import {
+  MR_IGNORE_ACTION,
+  MR_KEEP_WATCHING_ACTION,
+  REPOSITORY_IGNORE_ACTION,
+  TASK_ALLOW_ACTION,
+  TASK_DISCUSS_ACTION,
+  TASK_FEEDBACK_ACTION,
+  TASK_REJECT_ACTION,
+} from './task-action-card.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -96,6 +109,10 @@ export interface CardHandlerDeps {
   /** VC meeting invite/consumer card actions. Implemented in daemon to
    *  keep meeting sessions, tombstones, and listener-group state single-owned. */
   vcMeetingCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
+  /** Optional fail-closed task automation boundary. Other card features do not
+   * depend on it, so a host without Task OS configured can still run. */
+  taskActionDeps?: TaskActionHandlerDeps
+    | ((larkAppId: string) => TaskActionHandlerDeps | undefined);
 }
 
 /**
@@ -622,6 +639,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
+  if (isTaskAction(value?.action)) {
+    const taskDeps = typeof deps.taskActionDeps === 'function'
+      ? (larkAppId ? deps.taskActionDeps(larkAppId) : undefined)
+      : deps.taskActionDeps;
+    if (!taskDeps) {
+      return { toast: { type: 'error', content: '任务自动化未配置' } };
+    }
+    return handleTaskActionCard(data, taskDeps);
+  }
   // ─── 沙盒落盘卡（land_apply / land_discard）──────────────────────────────────
   // 不绑 session（sessionId + workingDir 都在 value 里）。owner 强闸门：只有 owner 能把
   // 隔离副本的改动应用回真实磁盘。agent 在沙盒里无感，不参与。
@@ -2557,4 +2583,18 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locTarget) } };
   }
   await commitRepoSelection(commitCtx, selectedPath, displayName);
+}
+
+const TASK_CARD_ACTIONS = new Set<string>([
+  TASK_ALLOW_ACTION,
+  TASK_REJECT_ACTION,
+  TASK_DISCUSS_ACTION,
+  TASK_FEEDBACK_ACTION,
+  MR_KEEP_WATCHING_ACTION,
+  MR_IGNORE_ACTION,
+  REPOSITORY_IGNORE_ACTION,
+]);
+
+function isTaskAction(value: unknown): boolean {
+  return typeof value === 'string' && TASK_CARD_ACTIONS.has(value);
 }
