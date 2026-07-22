@@ -182,6 +182,25 @@ describe('createTaskActionSink', () => {
     await expect(waitForProcessExit(childPid)).resolves.toBeUndefined();
   });
 
+  it('cancels the escalation timer once a timed-out child has closed', async () => {
+    const { sink } = await fixture('setInterval(() => {}, 1_000);', { timeoutMs: 20 });
+    const originalKill = process.kill.bind(process);
+    const signals: Array<NodeJS.Signals | number | undefined> = [];
+    process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+      if (pid < 0) signals.push(signal);
+      return originalKill(pid, signal as NodeJS.Signals | number | undefined);
+    }) as typeof process.kill;
+    try {
+      await expect(sink(request())).rejects.toMatchObject({
+        code: 'ERR_TASK_ACTION_SINK_TIMEOUT',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(signals).toEqual(['SIGTERM']);
+    } finally {
+      process.kill = originalKill;
+    }
+  });
+
   it('maps spawn failures to a stable private error', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'botmux-task-sink-'));
     directories.push(directory);

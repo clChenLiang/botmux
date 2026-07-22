@@ -204,11 +204,11 @@ function invokeTaskOs(
     });
     child.once('close', (code, signal) => {
       clearTimeout(timeout);
+      if (killTimer) clearTimeout(killTimer);
       if (terminalCode) {
         reject(new TaskActionSinkError(terminalCode));
         return;
       }
-      if (killTimer) clearTimeout(killTimer);
       if (code !== 0 || signal !== null) {
         reject(new TaskActionSinkError('ERR_TASK_ACTION_SINK_EXIT'));
         return;
