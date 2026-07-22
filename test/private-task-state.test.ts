@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -95,6 +96,54 @@ describe('private task state primitives', () => {
         chmodSync(path, 0o600);
       },
     })).rejects.toThrow(/ERR_TASK_CARD_STATE/);
+    await guard.close();
+  });
+
+  it('does not overwrite either namespace when the parent is retargeted before rename', async () => {
+    const root = privateDir();
+    const path = join(root, 'state.json');
+    writeFileSync(path, 'ORIGINAL', { mode: 0o600 });
+    chmodSync(path, 0o600);
+    const guard = await pinPrivateStateDirectory(root);
+    const moved = `${root}-pre-rename`;
+    roots.push(moved);
+    await expect(durablePrivateWrite(path, 'NEW-DATA', guard, {
+      beforeRename: () => {
+        renameSync(root, moved);
+        mkdirSync(root, { mode: 0o700 });
+        writeFileSync(path, 'REPLACE!', { mode: 0o600 });
+        chmodSync(path, 0o600);
+      },
+    })).rejects.toThrow(/ERR_TASK_CARD_STATE/);
+    expect(readFileSync(join(moved, 'state.json'), 'utf8')).toBe('ORIGINAL');
+    expect(readFileSync(path, 'utf8')).toBe('REPLACE!');
+    expect(readdirSync(moved).some((name) => name.endsWith('.tmp'))).toBe(false);
+    await guard.close();
+  });
+
+  it('rejects same-inode same-size in-place changes while reading', async () => {
+    const root = privateDir();
+    const path = join(root, 'state.json');
+    writeFileSync(path, '{"version":1}', { mode: 0o600 });
+    chmodSync(path, 0o600);
+    const guard = await pinPrivateStateDirectory(root);
+    await expect(readPrivateFile(path, 1024, false, guard, {
+      afterReadOpen: () => { writeFileSync(path, '{"version":2}'); },
+    })).rejects.toThrow(/ERR_TASK_CARD_STATE/);
+    await guard.close();
+  });
+
+  it('rejects same-inode same-size changes between reading and replacing state', async () => {
+    const root = privateDir();
+    const path = join(root, 'state.json');
+    writeFileSync(path, '{"version":1}', { mode: 0o600 });
+    chmodSync(path, 0o600);
+    const guard = await pinPrivateStateDirectory(root);
+    const snapshot = await readPrivateFile(path, 1024, false, guard);
+    writeFileSync(path, '{"version":2}');
+    await expect(durablePrivateWrite(path, '{"version":3}', guard, {}, snapshot))
+      .rejects.toThrow(/ERR_TASK_CARD_STATE/);
+    expect(readFileSync(path, 'utf8')).toBe('{"version":2}');
     await guard.close();
   });
 });

@@ -1,11 +1,11 @@
 import { createHash } from 'node:crypto';
 import { dirname, isAbsolute } from 'node:path';
 
-import { withFileLock } from '../utils/file-lock.js';
 import {
   durablePrivateWrite,
   pinPrivateStateDirectory,
   readPrivateFile,
+  withPrivateStateLock,
   type PrivateFileIdentity,
   type PrivateStateDirectory,
   type PrivateStateHooks,
@@ -65,7 +65,7 @@ export async function executeTaskCardDelivery(
     .catch(() => { throw new TaskCardDeliveryError('ERR_TASK_CARD_STATE'); });
   const guard = options.guard ?? ownedGuard!;
   const key = hash(`${request.kind}\0${request.deliveryId}`);
-  try { return await withFileLock(ledgerPath, async () => {
+  try { return await withPrivateStateLock(guard, '.task-card-deliveries.lock', async () => {
     await revalidate(guard);
     const loaded = await readLedger(ledgerPath, true, guard, options.privateStateHooks);
     const state = loaded?.state ?? emptyLedger();
@@ -83,7 +83,8 @@ export async function executeTaskCardDelivery(
         await revalidate(guard);
         return 'duplicate';
       }
-      if (Date.parse(request.now) - Date.parse(record.attemptedAt) >= FEISHU_DEDUPE_WINDOW_MS) {
+      const elapsed = Date.parse(request.now) - Date.parse(record.attemptedAt);
+      if (elapsed < 0 || elapsed >= FEISHU_DEDUPE_WINDOW_MS) {
         throw new TaskCardDeliveryError('ERR_TASK_CARD_UNCERTAIN');
       }
     } else {
@@ -164,7 +165,12 @@ async function readLedger(
     }
     return {
       state: { schemaVersion: 1, deliveries },
-      identity: { device: snapshot.device, inode: snapshot.inode },
+      identity: {
+        device: snapshot.device,
+        inode: snapshot.inode,
+        changeTimeNs: snapshot.changeTimeNs,
+        modifyTimeNs: snapshot.modifyTimeNs,
+      },
     };
   } catch (error) {
     if (error instanceof TaskCardDeliveryError) throw error;

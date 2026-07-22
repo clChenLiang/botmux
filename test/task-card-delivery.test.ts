@@ -90,6 +90,23 @@ describe('task card delivery', () => {
     expect(uuids).toHaveLength(3);
   });
 
+  it('fails closed without resending when the clock moves behind attemptedAt', async () => {
+    const root = stateDir();
+    let now = '2026-07-22T00:00:00.000Z';
+    let sends = 0;
+    const deps = {
+      now: () => now,
+      registerBot: async () => {},
+      sendMessage: async () => { sends += 1; throw new Error('ambiguous'); },
+    };
+    await expect(deliverTaskCard(root, 'candidate', candidateEnvelope(), deps))
+      .rejects.toThrow(/ERR_TASK_CARD_SEND/);
+    now = '2026-07-21T23:59:59.999Z';
+    await expect(deliverTaskCard(root, 'candidate', candidateEnvelope(), deps))
+      .rejects.toThrow(/ERR_TASK_CARD_UNCERTAIN/);
+    expect(sends).toBe(1);
+  });
+
   it('supports exact completion and MR contracts and rejects delivery id reuse', async () => {
     const root = stateDir();
     const bodies: string[] = [];

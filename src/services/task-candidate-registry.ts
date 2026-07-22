@@ -1,11 +1,11 @@
 import { dirname, isAbsolute } from 'node:path';
 
 import type { TaskCandidateRecord } from './task-action-dispatch.js';
-import { withFileLock } from '../utils/file-lock.js';
 import {
   durablePrivateWrite,
   pinPrivateStateDirectory,
   readPrivateFile,
+  withPrivateStateLock,
   type PrivateFileIdentity,
   type PrivateStateDirectory,
   type PrivateStateHooks,
@@ -45,51 +45,55 @@ export function createTaskCandidateRegistry(
     },
     async persist(record) {
       const parsed = parseRecord(record, record?.candidateId);
-      return withGuard(registryPath, async (guard) => withFileLock(registryPath, async () => {
-        await guard.revalidate();
-        const loaded = await readState(registryPath, true, guard, options.privateStateHooks);
-        const state = loaded?.state ?? emptyState();
-        const existing = Object.prototype.hasOwnProperty.call(state.candidates, parsed.candidateId)
-          ? state.candidates[parsed.candidateId] : undefined;
-        if (existing !== undefined) {
-          let current: TaskCandidateRecord;
-          try { current = parseRecord(existing, parsed.candidateId); } catch { throw new Error('task candidate registry invalid'); }
-          const comparableCurrent = { ...current };
-          if (parsed.rootMessageId === undefined) delete comparableCurrent.rootMessageId;
-          if (parsed.originalSessionId === undefined) delete comparableCurrent.originalSessionId;
-          if (JSON.stringify(comparableCurrent) === JSON.stringify(parsed)) return 'duplicate';
-          throw new Error('task candidate registry conflict');
-        }
-        Object.defineProperty(state.candidates, parsed.candidateId, {
-          value: parsed, enumerable: true, configurable: true, writable: true,
-        });
-        await writeState(registryPath, state, guard, options.privateStateHooks, loaded?.identity ?? null);
-        await guard.revalidate();
-        return 'created';
-      }));
+      return withGuard(registryPath, async (guard) => withPrivateStateLock(
+        guard, '.task-candidates.lock', async () => {
+          await guard.revalidate();
+          const loaded = await readState(registryPath, true, guard, options.privateStateHooks);
+          const state = loaded?.state ?? emptyState();
+          const existing = Object.prototype.hasOwnProperty.call(state.candidates, parsed.candidateId)
+            ? state.candidates[parsed.candidateId] : undefined;
+          if (existing !== undefined) {
+            let current: TaskCandidateRecord;
+            try { current = parseRecord(existing, parsed.candidateId); } catch { throw new Error('task candidate registry invalid'); }
+            const comparableCurrent = { ...current };
+            if (parsed.rootMessageId === undefined) delete comparableCurrent.rootMessageId;
+            if (parsed.originalSessionId === undefined) delete comparableCurrent.originalSessionId;
+            if (JSON.stringify(comparableCurrent) === JSON.stringify(parsed)) return 'duplicate';
+            throw new Error('task candidate registry conflict');
+          }
+          Object.defineProperty(state.candidates, parsed.candidateId, {
+            value: parsed, enumerable: true, configurable: true, writable: true,
+          });
+          await writeState(registryPath, state, guard, options.privateStateHooks, loaded?.identity ?? null);
+          await guard.revalidate();
+          return 'created';
+        },
+      ));
     },
     async bindRootMessage(candidateId, rootMessageId) {
       if (!isOpaque(candidateId) || !isOpaque(rootMessageId)) {
         throw new Error('task candidate identifier invalid');
       }
-      return withGuard(registryPath, async (guard) => withFileLock(registryPath, async () => {
-        await guard.revalidate();
-        const loaded = await readState(registryPath, false, guard, options.privateStateHooks);
-        const state = loaded.state;
-        const existing = Object.prototype.hasOwnProperty.call(state.candidates, candidateId)
-          ? state.candidates[candidateId] : undefined;
-        if (existing === undefined) throw new Error('task candidate registry invalid');
-        let current: TaskCandidateRecord;
-        try { current = parseRecord(existing, candidateId); } catch { throw new Error('task candidate registry invalid'); }
-        if (current.rootMessageId === rootMessageId) return 'duplicate';
-        if (current.rootMessageId !== undefined) throw new Error('task candidate registry conflict');
-        Object.defineProperty(state.candidates, candidateId, {
-          value: { ...current, rootMessageId }, enumerable: true, configurable: true, writable: true,
-        });
-        await writeState(registryPath, state, guard, options.privateStateHooks, loaded.identity);
-        await guard.revalidate();
-        return 'updated';
-      }));
+      return withGuard(registryPath, async (guard) => withPrivateStateLock(
+        guard, '.task-candidates.lock', async () => {
+          await guard.revalidate();
+          const loaded = await readState(registryPath, false, guard, options.privateStateHooks);
+          const state = loaded.state;
+          const existing = Object.prototype.hasOwnProperty.call(state.candidates, candidateId)
+            ? state.candidates[candidateId] : undefined;
+          if (existing === undefined) throw new Error('task candidate registry invalid');
+          let current: TaskCandidateRecord;
+          try { current = parseRecord(existing, candidateId); } catch { throw new Error('task candidate registry invalid'); }
+          if (current.rootMessageId === rootMessageId) return 'duplicate';
+          if (current.rootMessageId !== undefined) throw new Error('task candidate registry conflict');
+          Object.defineProperty(state.candidates, candidateId, {
+            value: { ...current, rootMessageId }, enumerable: true, configurable: true, writable: true,
+          });
+          await writeState(registryPath, state, guard, options.privateStateHooks, loaded.identity);
+          await guard.revalidate();
+          return 'updated';
+        },
+      ));
     },
   };
 }
@@ -142,7 +146,12 @@ async function readState(
     }
     return {
       state: { schemaVersion: 1, candidates },
-      identity: { device: snapshot.device, inode: snapshot.inode },
+      identity: {
+        device: snapshot.device,
+        inode: snapshot.inode,
+        changeTimeNs: snapshot.changeTimeNs,
+        modifyTimeNs: snapshot.modifyTimeNs,
+      },
     };
   } catch { throw new Error('task candidate registry invalid'); }
 }
