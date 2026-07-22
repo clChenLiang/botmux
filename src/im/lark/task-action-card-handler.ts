@@ -34,7 +34,7 @@ export type TaskActionPersistenceResult = {
   outcome: 'recorded' | 'duplicate' | 'conflict';
   effectiveAction: PersistedTaskAction;
 } & (
-  | { triggerRequired: true; idempotencyKey: string }
+  | { triggerRequired: true; idempotencyKey: string; dispatchToken: string }
   | { triggerRequired: false }
 );
 
@@ -45,6 +45,8 @@ export interface TaskActionTriggerRequest {
   operatorOpenId: string;
   /** Stable opaque key allocated by the durable sink/outbox. */
   idempotencyKey: string;
+  /** Per-claim fencing token; unlike idempotencyKey this changes on reclaim. */
+  dispatchToken: string;
 }
 
 export interface TaskActionHandlerDeps {
@@ -53,8 +55,9 @@ export interface TaskActionHandlerDeps {
   /**
    * At-least-once boundary: the durable sink atomically decides whether this
    * callback owns a delivery attempt. A claimed attempt may be retried after a
-   * crash or failure, always with the same idempotencyKey. Downstream execution
-   * must deduplicate that key and durably mark the outbox item dispatched.
+   * crash or failure, always with the same idempotencyKey and a fresh
+   * dispatchToken. Downstream execution must deduplicate the stable key, fence
+   * stale claims with the token, and durably mark the current claim dispatched.
    */
   trigger: (request: TaskActionTriggerRequest) => void | Promise<void>;
 }
@@ -131,6 +134,7 @@ export async function handleTaskActionCard(
       persisted.effectiveAction,
       parsed.operatorOpenId,
       persisted.idempotencyKey,
+      persisted.dispatchToken,
     );
     if (!triggerRequest) return persistenceFailedResult();
     try {
@@ -207,6 +211,7 @@ function toTriggerRequest(
   action: PersistedTaskAction,
   operatorOpenId: string,
   idempotencyKey: string,
+  dispatchToken: string,
 ): TaskActionTriggerRequest | undefined {
   if (subject.type !== 'candidate') return undefined;
   if (action === TASK_ALLOW_ACTION) {
@@ -216,6 +221,7 @@ function toTriggerRequest(
       mode: 'work',
       operatorOpenId,
       idempotencyKey,
+      dispatchToken,
     };
   }
   if (action === TASK_DISCUSS_ACTION) {
@@ -225,6 +231,7 @@ function toTriggerRequest(
       mode: 'discussion',
       operatorOpenId,
       idempotencyKey,
+      dispatchToken,
     };
   }
   if (action === TASK_FEEDBACK_ACTION) {
@@ -234,6 +241,7 @@ function toTriggerRequest(
       mode: 'feedback',
       operatorOpenId,
       idempotencyKey,
+      dispatchToken,
     };
   }
   return undefined;
@@ -283,15 +291,18 @@ function parsePersistenceResult(
   if (typeof data.triggerRequired !== 'boolean') return undefined;
 
   if (data.triggerRequired) {
-    if (!isOpaqueId(data.idempotencyKey) || !isTriggerableAction(effectiveAction)) return undefined;
+    if (!isOpaqueId(data.idempotencyKey)
+      || !isOpaqueId(data.dispatchToken)
+      || !isTriggerableAction(effectiveAction)) return undefined;
     return {
       outcome: data.outcome,
       effectiveAction,
       triggerRequired: true,
       idempotencyKey: data.idempotencyKey,
+      dispatchToken: data.dispatchToken,
     };
   }
-  if (Object.hasOwn(data, 'idempotencyKey')) return undefined;
+  if (Object.hasOwn(data, 'idempotencyKey') || Object.hasOwn(data, 'dispatchToken')) return undefined;
   return {
     outcome: data.outcome,
     effectiveAction,

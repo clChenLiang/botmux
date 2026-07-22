@@ -40,6 +40,7 @@ function harness(overrides: Partial<TaskActionHandlerDeps> = {}) {
         effectiveAction: request.action,
         triggerRequired: true as const,
         idempotencyKey: `delivery.${request.subject.id}`,
+        dispatchToken: `claim.${request.subject.id}`,
       };
     }
     return {
@@ -80,6 +81,7 @@ describe('handleTaskActionCard', () => {
     expect(h.trigger).toHaveBeenCalledWith({
       action,
       candidateId: CANDIDATE_ID,
+      dispatchToken: `claim.${CANDIDATE_ID}`,
       idempotencyKey: `delivery.${CANDIDATE_ID}`,
       mode,
       operatorOpenId: OWNER,
@@ -144,7 +146,10 @@ describe('handleTaskActionCard', () => {
           effectiveAction: request.action,
           triggerRequired: request.action === TASK_ALLOW_ACTION,
           ...(request.action === TASK_ALLOW_ACTION
-            ? { idempotencyKey: `delivery.${request.subject.id}` }
+            ? {
+                idempotencyKey: `delivery.${request.subject.id}`,
+                dispatchToken: `claim.${request.subject.id}`,
+              }
             : {}),
         };
       }
@@ -256,18 +261,22 @@ describe('handleTaskActionCard', () => {
 
   it('retries a failed trigger only when a duplicate sink result atomically reclaims pending work', async () => {
     const idempotencyKey = 'task_delivery.candidate_01JZ8N9QG5';
+    const firstDispatchToken = 'claim_019f6d58-c1fb-7c81-9c92-33875698797f';
+    const retryDispatchToken = 'claim_019f6d58-c1fb-7c81-9c92-338756987980';
     const persist = vi.fn()
       .mockResolvedValueOnce({
         outcome: 'recorded',
         effectiveAction: TASK_ALLOW_ACTION,
         triggerRequired: true,
         idempotencyKey,
+        dispatchToken: firstDispatchToken,
       })
       .mockResolvedValueOnce({
         outcome: 'duplicate',
         effectiveAction: TASK_ALLOW_ACTION,
         triggerRequired: true,
         idempotencyKey,
+        dispatchToken: retryDispatchToken,
       });
     const trigger = vi.fn()
       .mockRejectedValueOnce(new Error('temporary start failure'))
@@ -284,6 +293,7 @@ describe('handleTaskActionCard', () => {
     expect(trigger).toHaveBeenNthCalledWith(1, {
       action: TASK_ALLOW_ACTION,
       candidateId: CANDIDATE_ID,
+      dispatchToken: firstDispatchToken,
       idempotencyKey,
       mode: 'work',
       operatorOpenId: OWNER,
@@ -291,6 +301,7 @@ describe('handleTaskActionCard', () => {
     expect(trigger).toHaveBeenNthCalledWith(2, {
       action: TASK_ALLOW_ACTION,
       candidateId: CANDIDATE_ID,
+      dispatchToken: retryDispatchToken,
       idempotencyKey,
       mode: 'work',
       operatorOpenId: OWNER,
@@ -358,4 +369,48 @@ describe('handleTaskActionCard', () => {
       expect(result).toEqual({ toast: { type: 'error', content: '操作保存失败，请稍后重试' } });
     },
   );
+
+  it.each([
+    undefined,
+    null,
+    '',
+    '../stale-claim',
+    'contains space',
+    'x'.repeat(129),
+    {},
+  ])('rejects missing or malformed sink dispatchToken %j', async (dispatchToken) => {
+    const h = harness({
+      persist: vi.fn(async () => ({
+        outcome: 'recorded',
+        effectiveAction: TASK_ALLOW_ACTION,
+        triggerRequired: true,
+        idempotencyKey: 'task_delivery.candidate_01JZ8N9QG5',
+        dispatchToken,
+      } as any)),
+    });
+    const result = await handleTaskActionCard(callback(TASK_ALLOW_ACTION), h.deps);
+    expect(h.trigger).not.toHaveBeenCalled();
+    expect(result).toEqual({ toast: { type: 'error', content: '操作保存失败，请稍后重试' } });
+  });
+
+  it.each([
+    { dispatchToken: 'claim_stale' },
+    { idempotencyKey: 'task_delivery.candidate_01JZ8N9QG5' },
+    {
+      idempotencyKey: 'task_delivery.candidate_01JZ8N9QG5',
+      dispatchToken: 'claim_stale',
+    },
+  ])('rejects trigger fencing fields on a non-triggering sink result %#', async (extra) => {
+    const h = harness({
+      persist: vi.fn(async () => ({
+        outcome: 'duplicate',
+        effectiveAction: TASK_ALLOW_ACTION,
+        triggerRequired: false,
+        ...extra,
+      } as any)),
+    });
+    const result = await handleTaskActionCard(callback(TASK_ALLOW_ACTION), h.deps);
+    expect(h.trigger).not.toHaveBeenCalled();
+    expect(result).toEqual({ toast: { type: 'error', content: '操作保存失败，请稍后重试' } });
+  });
 });
