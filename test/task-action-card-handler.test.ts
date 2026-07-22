@@ -413,4 +413,29 @@ describe('handleTaskActionCard', () => {
     expect(h.trigger).not.toHaveBeenCalled();
     expect(result).toEqual({ toast: { type: 'error', content: '操作保存失败，请稍后重试' } });
   });
+
+  it.each([
+    {
+      outcome: 'recorded',
+      effectiveAction: TASK_ALLOW_ACTION,
+      triggerRequired: true,
+      idempotencyKey: 'task_delivery.candidate_01JZ8N9QG5',
+      dispatchToken: 'claim_019f6d58-c1fb-7c81-9c92-33875698797f',
+      PRIVATE_EXTRA: 'SECRET_TRUE_BRANCH',
+    },
+    {
+      outcome: 'duplicate',
+      effectiveAction: TASK_ALLOW_ACTION,
+      triggerRequired: false,
+      PRIVATE_EXTRA: 'SECRET_FALSE_BRANCH',
+    },
+  ])('rejects unknown private sink result fields before triggering %#', async (sinkResult) => {
+    const h = harness({ persist: vi.fn(async () => sinkResult as any) });
+    const result = await handleTaskActionCard(callback(TASK_ALLOW_ACTION), h.deps);
+    expect(h.deps.persist).toHaveBeenCalledOnce();
+    expect(h.trigger).not.toHaveBeenCalled();
+    expect(result).toEqual({ toast: { type: 'error', content: '操作保存失败，请稍后重试' } });
+    expect(JSON.stringify(result)).not.toContain('PRIVATE_EXTRA');
+    expect(JSON.stringify(result)).not.toContain('SECRET_');
+  });
 });

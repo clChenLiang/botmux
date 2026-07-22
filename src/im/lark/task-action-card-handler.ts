@@ -277,6 +277,11 @@ function parsePersistenceResult(
     return undefined;
   }
   if (!isRecord(data)) return undefined;
+  if (typeof data.triggerRequired !== 'boolean') return undefined;
+  const expectedKeys = data.triggerRequired
+    ? ['outcome', 'effectiveAction', 'triggerRequired', 'idempotencyKey', 'dispatchToken']
+    : ['outcome', 'effectiveAction', 'triggerRequired'];
+  if (!hasExactOwnKeys(data, expectedKeys)) return undefined;
   if (data.outcome !== 'recorded' && data.outcome !== 'duplicate' && data.outcome !== 'conflict') {
     return undefined;
   }
@@ -288,7 +293,6 @@ function parsePersistenceResult(
   if (data.outcome === 'recorded' && effectiveAction !== callback.action) return undefined;
   if (data.outcome === 'duplicate' && effectiveAction !== callback.action) return undefined;
   if (data.outcome === 'conflict' && effectiveAction === callback.action) return undefined;
-  if (typeof data.triggerRequired !== 'boolean') return undefined;
 
   if (data.triggerRequired) {
     if (!isOpaqueId(data.idempotencyKey)
@@ -334,6 +338,11 @@ function isOpaqueId(value: unknown): value is string {
 
 function isRecord(value: unknown): value is PlainRecord {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hasExactOwnKeys(value: PlainRecord, expected: readonly string[]): boolean {
+  const keys = Object.keys(value);
+  return keys.length === expected.length && expected.every((key) => Object.hasOwn(value, key));
 }
 
 function toast(
