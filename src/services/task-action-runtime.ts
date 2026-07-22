@@ -52,9 +52,11 @@ export interface TaskActionRuntime {
   handlerDeps: TaskActionHandlerDeps;
   /** Narrow recovery ingress for claims obtained from Task OS after reconcile. */
   recover: (request: TaskActionTriggerRequest) => Promise<void>;
+  close: () => void;
 }
 
 export function createTaskActionRuntime(config: TaskActionRuntimeConfig): TaskActionRuntime {
+  let closed = false;
   const trigger = createTaskActionDispatch({
     repoRoot: config.repoRoot,
     repositories: config.repositories,
@@ -88,6 +90,11 @@ export function createTaskActionRuntime(config: TaskActionRuntimeConfig): TaskAc
       trigger,
     },
     recover: trigger,
+    close: () => {
+      if (closed) return;
+      closed = true;
+      config.startLedger.close();
+    },
   };
 }
 

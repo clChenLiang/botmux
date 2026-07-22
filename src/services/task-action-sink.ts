@@ -1,5 +1,8 @@
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
-import { dirname, isAbsolute } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { constants } from 'node:fs';
+import { lstat, open, rm } from 'node:fs/promises';
+import { dirname, isAbsolute, join } from 'node:path';
 
 import {
   MR_IGNORE_ACTION,
@@ -44,10 +47,25 @@ export interface TaskActionReconcileResult {
   existing: number;
   items: Array<{
     candidateId: string;
-    action: typeof TASK_ALLOW_ACTION | typeof TASK_DISCUSS_ACTION;
+    action: typeof TASK_ALLOW_ACTION | typeof TASK_DISCUSS_ACTION | typeof TASK_FEEDBACK_ACTION;
     idempotencyKey: string;
     state: string;
   }>;
+}
+
+export interface TaskActionRecoveryClaim {
+  action: typeof TASK_ALLOW_ACTION | typeof TASK_DISCUSS_ACTION | typeof TASK_FEEDBACK_ACTION;
+  candidateId: string;
+  idempotencyKey: string;
+  dispatchToken: string;
+  claimedAt: string;
+  claimExpiresAt: string;
+}
+
+export interface TaskActionRecoveryOptions {
+  limit: number;
+  leaseMs: number;
+  now: string;
 }
 
 type TaskActionSinkErrorCode =
@@ -159,6 +177,161 @@ export function createTaskActionReconciler(
   return async () => parseReconcileResult(await invokeTaskOs(config, [
     'task-action', 'reconcile', '--state-dir', config.stateDir, '--json',
   ], runtime));
+}
+
+/** Claim only task-action trigger work. Sensitive fencing tokens are read from
+ * a private one-shot sidecar; stdout is validated as metadata-only. */
+export function createTaskActionRecoveryClaimer(
+  untrustedConfig: TaskActionSinkConfig,
+  runtime: TaskActionSinkRuntime = DEFAULT_RUNTIME,
+): (options: TaskActionRecoveryOptions) => Promise<TaskActionRecoveryClaim[]> {
+  const config = parseConfig(untrustedConfig);
+  return async (untrustedOptions) => {
+    const options = parseRecoveryOptions(untrustedOptions);
+    const outputFile = join(
+      config.stateDir,
+      `task-action-recovery-${process.pid}-${randomUUID()}.json`,
+    );
+    let identity: FileIdentity | undefined;
+    try {
+      const stdout = await invokeTaskOs(config, [
+        'task-action', 'recover',
+        '--state-dir', config.stateDir,
+        '--limit', String(options.limit),
+        '--lease-ms', String(options.leaseMs),
+        '--now', options.now,
+        '--output-file', outputFile,
+        '--json',
+      ], runtime);
+      const summary = parseRecoverySummary(stdout);
+      const sidecar = await readPrivateRecoveryFile(outputFile);
+      identity = sidecar.identity;
+      const claims = parseRecoveryClaims(sidecar.raw);
+      if (summary.length !== claims.length) throw new Error('count mismatch');
+      for (let index = 0; index < claims.length; index += 1) {
+        const claim = claims[index]!;
+        const metadata = summary[index]!;
+        if (claim.action !== metadata.action
+          || claim.candidateId !== metadata.candidateId
+          || claim.idempotencyKey !== metadata.idempotencyKey
+          || claim.claimedAt !== metadata.claimedAt
+          || claim.claimExpiresAt !== metadata.claimExpiresAt) {
+          throw new Error('recovery metadata mismatch');
+        }
+      }
+      return claims;
+    } catch (error) {
+      if (error instanceof TaskActionSinkError) throw error;
+      throw new TaskActionSinkError('ERR_TASK_ACTION_SINK_PROTOCOL');
+    } finally {
+      await removeRecoveryFile(outputFile, identity);
+    }
+  };
+}
+
+type FileIdentity = { device: bigint; inode: bigint };
+
+async function readPrivateRecoveryFile(
+  filePath: string,
+): Promise<{ raw: string; identity: FileIdentity }> {
+  const before = await lstat(filePath, { bigint: true });
+  const expectedUid = typeof process.getuid === 'function' ? BigInt(process.getuid()) : before.uid;
+  if (!before.isFile() || before.isSymbolicLink() || before.uid !== expectedUid
+    || (before.mode & 0o777n) !== 0o600n || before.size > 1024n * 1024n) {
+    throw new Error('unsafe recovery file');
+  }
+  const handle = await open(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = await handle.stat({ bigint: true });
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino
+      || opened.uid !== expectedUid || (opened.mode & 0o777n) !== 0o600n
+      || opened.size > 1024n * 1024n) throw new Error('recovery file changed');
+    return {
+      raw: await handle.readFile({ encoding: 'utf8' }),
+      identity: { device: opened.dev, inode: opened.ino },
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function removeRecoveryFile(filePath: string, identity?: FileIdentity): Promise<void> {
+  try {
+    const current = await lstat(filePath, { bigint: true });
+    if (identity && (current.dev !== identity.device || current.ino !== identity.inode)) {
+      throw new Error('recovery file was replaced');
+    }
+    await rm(filePath, { force: true });
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return;
+    throw new TaskActionSinkError('ERR_TASK_ACTION_SINK_PROTOCOL');
+  }
+}
+
+function parseRecoveryOptions(value: unknown): TaskActionRecoveryOptions {
+  try {
+    const data = exactDataRecord(value, ['limit', 'leaseMs', 'now'], ['limit', 'leaseMs', 'now']);
+    const limit = boundedInteger(data.limit, 0, 1, 1_000);
+    const leaseMs = boundedInteger(data.leaseMs, 0, 1_000, 7 * 24 * 60 * 60 * 1_000);
+    if (typeof data.now !== 'string' || new Date(data.now).toISOString() !== data.now) {
+      throw new Error('invalid instant');
+    }
+    return { limit, leaseMs, now: data.now };
+  } catch {
+    throw new TaskActionSinkError('ERR_TASK_ACTION_SINK_INPUT');
+  }
+}
+
+function parseRecoverySummary(stdout: string): Omit<TaskActionRecoveryClaim, 'dispatchToken'>[] {
+  try {
+    const parsed: unknown = JSON.parse(stdout);
+    const data = exactDataRecord(parsed, ['count', 'items'], ['count', 'items']);
+    if (!Number.isSafeInteger(data.count) || (data.count as number) < 0
+      || !Array.isArray(data.items) || data.items.length !== data.count) throw new Error();
+    return data.items.map((item) => parseRecoveryRow(item, false));
+  } catch {
+    throw new TaskActionSinkError('ERR_TASK_ACTION_SINK_PROTOCOL');
+  }
+}
+
+function parseRecoveryClaims(raw: string): TaskActionRecoveryClaim[] {
+  const parsed: unknown = JSON.parse(raw);
+  const data = exactDataRecord(parsed, ['items'], ['items']);
+  if (!Array.isArray(data.items) || data.items.length > 1_000) throw new Error();
+  return data.items.map((item) => parseRecoveryRow(item, true) as TaskActionRecoveryClaim);
+}
+
+function parseRecoveryRow(
+  value: unknown,
+  sensitive: boolean,
+): TaskActionRecoveryClaim | Omit<TaskActionRecoveryClaim, 'dispatchToken'> {
+  const keys = sensitive
+    ? ['action', 'candidateId', 'idempotencyKey', 'dispatchToken', 'claimedAt', 'claimExpiresAt']
+    : ['action', 'candidateId', 'idempotencyKey', 'claimedAt', 'claimExpiresAt'];
+  const data = exactDataRecord(value, keys, keys);
+  if (!TRIGGER_ACTIONS.has(data.action as string)
+    || !isOpaqueId(data.candidateId)
+    || typeof data.idempotencyKey !== 'string'
+    || !/^action:[a-f0-9]{64}$/.test(data.idempotencyKey)
+    || !isIsoInstant(data.claimedAt)
+    || !isIsoInstant(data.claimExpiresAt)
+    || Date.parse(data.claimExpiresAt) <= Date.parse(data.claimedAt)) throw new Error();
+  const base = {
+    action: data.action as TaskActionRecoveryClaim['action'],
+    candidateId: data.candidateId,
+    idempotencyKey: data.idempotencyKey,
+    claimedAt: data.claimedAt,
+    claimExpiresAt: data.claimExpiresAt,
+  };
+  if (!sensitive) return base;
+  if (!isOpaqueId(data.dispatchToken)) throw new Error();
+  return { ...base, dispatchToken: data.dispatchToken };
+}
+
+function isIsoInstant(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const time = new Date(value);
+  return Number.isFinite(time.getTime()) && time.toISOString() === value;
 }
 
 function parseConfig(value: unknown): SafeConfig {
@@ -459,13 +632,13 @@ function parseReconcileResult(stdout: string): TaskActionReconcileResult {
         'candidateId', 'action', 'idempotencyKey', 'state',
       ]);
       if (!isOpaqueId(row.candidateId) || !isOpaqueId(row.idempotencyKey)
-        || (row.action !== TASK_ALLOW_ACTION && row.action !== TASK_DISCUSS_ACTION)
+        || !TRIGGER_ACTIONS.has(row.action as string)
         || typeof row.state !== 'string' || row.state.length === 0 || row.state.length > 32) {
         throw new Error('invalid reconcile item');
       }
       return {
         candidateId: row.candidateId,
-        action: row.action,
+        action: row.action as TaskActionReconcileResult['items'][number]['action'],
         idempotencyKey: row.idempotencyKey,
         state: row.state,
       };

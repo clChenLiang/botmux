@@ -214,10 +214,19 @@ import {
   RealtimeVoiceSession,
 } from './vc-agent/realtime/index.js';
 import { createGroupWithBots } from './services/group-creator.js';
-import { createTaskActionSink, createTaskActionDispatchAcknowledger, createTaskActionReconciler } from './services/task-action-sink.js';
+import {
+  createTaskActionSink,
+  createTaskActionDispatchAcknowledger,
+  createTaskActionReconciler,
+  createTaskActionRecoveryClaimer,
+} from './services/task-action-sink.js';
 import { createTaskCandidateRegistry } from './services/task-candidate-registry.js';
 import { createTaskActionRuntime, type TaskActionRuntime } from './services/task-action-runtime.js';
 import { createTaskActionStartLedger } from './services/task-action-start-ledger.js';
+import {
+  createTaskActionRecoveryLoop,
+  type TaskActionRecoveryLoop,
+} from './services/task-action-recovery-loop.js';
 import { addBotToChat, isInChat } from './services/groups-store.js';
 import { setChatReplyMode } from './services/chat-reply-mode-store.js';
 import {
@@ -2498,6 +2507,15 @@ const v3GateRunner = createV3GateRunner({
 });
 
 let taskActionRuntimeCache: { larkAppId: string; runtime: TaskActionRuntime } | null | undefined;
+let taskActionRecoveryLoop: TaskActionRecoveryLoop | undefined;
+
+function stopTaskActionRuntime(): void {
+  taskActionRecoveryLoop?.stop();
+  taskActionRecoveryLoop = undefined;
+  const cached = taskActionRuntimeCache;
+  taskActionRuntimeCache = null;
+  try { cached?.runtime.close(); } catch { /* best-effort shutdown */ }
+}
 
 /** Lazily enable task automation for exactly one configured bot. Any missing or
  * malformed setting disables only this namespace; the daemon's other features
@@ -2541,7 +2559,7 @@ function configuredTaskActionRuntime(larkAppId: string): TaskActionRuntime | und
     if (!isAbsolute(registryPath)) throw new Error('candidate registry path must be absolute');
     const registry = createTaskCandidateRegistry(registryPath);
     const startLedgerPath = process.env.BOTMUX_TASK_START_LEDGER?.trim()
-      || join(config.session.dataDir, 'task-action-starts.sqlite');
+      || join(config.session.dataDir, 'task-action-private', 'starts.sqlite');
     if (!isAbsolute(startLedgerPath)) throw new Error('task start ledger path must be absolute');
     const runtime = createTaskActionRuntime({
       ownerOpenId,
@@ -2580,7 +2598,6 @@ function configuredTaskActionRuntime(larkAppId: string): TaskActionRuntime | und
               candidateId: request.candidateId,
               sourceRef: request.sourceRef,
               mode: request.mode,
-              dispatchToken: request.dispatchToken,
             },
           },
           instruction: request.instruction,
@@ -2598,12 +2615,24 @@ function configuredTaskActionRuntime(larkAppId: string): TaskActionRuntime | und
         };
       },
     });
-    void createTaskActionReconciler(sinkConfig)().then((result) => {
-      if (result.created > 0) {
-        logger.info(`[task-action] reconciled ${result.created} orphan trigger(s); Task OS recovery can reclaim them`);
-      }
-    }).catch(() => {
-      logger.warn('[task-action] startup reconcile failed; durable state remains retryable');
+    const reconcile = createTaskActionReconciler(sinkConfig);
+    const claim = createTaskActionRecoveryClaimer(sinkConfig);
+    taskActionRecoveryLoop = createTaskActionRecoveryLoop({
+      intervalMs: 60_000,
+      leaseMs: 120_000,
+      limit: 16,
+      reconcile,
+      claim,
+      dispatch: (item) => runtime.recover({
+        action: item.action,
+        candidateId: item.candidateId,
+        mode: item.action === 'task_allow' ? 'work'
+          : item.action === 'task_feedback' ? 'feedback' : 'discussion',
+        operatorOpenId: ownerOpenId,
+        idempotencyKey: item.idempotencyKey,
+        dispatchToken: item.dispatchToken,
+      }),
+      log: (level, message) => level === 'info' ? logger.info(message) : logger.warn(message),
     });
     taskActionRuntimeCache = { larkAppId: configuredAppId, runtime };
   } catch (error) {
@@ -8791,6 +8820,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Restore active sessions from previous run
   await restoreActiveSessions(activeSessions);
 
+  // Recovery starts only after persisted sessions are available, so feedback
+  // actions can prefer their original conversation. Configuration is narrow:
+  // a different bot app id simply leaves this daemon's task runtime disabled.
+  configuredTaskActionRuntime(cfg.larkAppId);
+  void taskActionRecoveryLoop?.start();
+
   // Second global-skills sweep, AFTER restore has settled. The early
   // cleanupGlobalBotmuxSkillsOnce() pass (in the startup ensureCliEnv above)
   // runs before any restart overlap settles, so an outgoing old-build daemon
@@ -8928,6 +8963,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     stopCliRuntimeUpdateMonitor();
     clearInterval(maintenanceHeartbeat);
     clearInterval(docCommentPollTimer);
+    stopTaskActionRuntime();
     for (const watcher of workflowEventWatchers.values()) watcher.close();
     workflowEventWatchers.clear();
     workflowRuns.clear();
@@ -9009,6 +9045,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(docCommentPollTimer);
+    stopTaskActionRuntime();
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     // Plain-exit path (uncaught fatal, manual process.exit) bypasses the

@@ -1,6 +1,6 @@
 import { type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   createTaskActionDispatchAcknowledger,
   createTaskActionReconciler,
+  createTaskActionRecoveryClaimer,
   createTaskActionSink,
   TaskActionSinkError,
 } from '../src/services/task-action-sink.js';
@@ -18,6 +19,7 @@ import {
   REPOSITORY_IGNORE_ACTION,
   TASK_ALLOW_ACTION,
   TASK_DISCUSS_ACTION,
+  TASK_FEEDBACK_ACTION,
   TASK_REJECT_ACTION,
 } from '../src/im/lark/task-action-card.js';
 
@@ -63,10 +65,77 @@ function responder(result: unknown, extra = ''): string {
 }
 
 describe('createTaskActionSink', () => {
+  it('claims recovery work through an exact private sidecar and deletes it after parsing', async () => {
+    const { config, stateDir } = await fixture(`
+      import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
+      const args = process.argv.slice(2);
+      const output = args[args.indexOf('--output-file') + 1];
+      const stateDir = args[args.indexOf('--state-dir') + 1];
+      mkdirSync(stateDir, { recursive: true });
+      const item = {
+        action: 'task_allow', candidateId: 'candidate_17',
+        idempotencyKey: 'action:${'a'.repeat(64)}', dispatchToken: 'claim.recovery.17',
+        claimedAt: '2026-07-22T00:00:00.000Z', claimExpiresAt: '2026-07-22T00:02:00.000Z',
+      };
+      writeFileSync(output, JSON.stringify({ items: [item] }), { mode: 0o600 });
+      chmodSync(output, 0o600);
+      process.stdout.write(JSON.stringify({ count: 1, items: [{
+        action: item.action, candidateId: item.candidateId,
+        idempotencyKey: item.idempotencyKey, claimedAt: item.claimedAt,
+        claimExpiresAt: item.claimExpiresAt,
+      }] }));
+    `);
+    await mkdir(stateDir, { recursive: true, mode: 0o700 });
+    const recover = createTaskActionRecoveryClaimer(config);
+    const result = await recover({
+      limit: 8, leaseMs: 120_000, now: '2026-07-22T00:00:00.000Z',
+    });
+    expect(result).toEqual([{
+      action: TASK_ALLOW_ACTION, candidateId: 'candidate_17',
+      idempotencyKey: `action:${'a'.repeat(64)}`, dispatchToken: 'claim.recovery.17',
+      claimedAt: '2026-07-22T00:00:00.000Z', claimExpiresAt: '2026-07-22T00:02:00.000Z',
+    }]);
+    const remaining = await import('node:fs/promises').then(({ readdir }) => readdir(stateDir));
+    expect(remaining.filter((name) => name.startsWith('task-action-recovery-'))).toEqual([]);
+  });
+
+  it('rejects and removes non-private or malformed recovery sidecars without leaking tokens', async () => {
+    const { config, stateDir } = await fixture(`
+      import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
+      const args = process.argv.slice(2);
+      const output = args[args.indexOf('--output-file') + 1];
+      const stateDir = args[args.indexOf('--state-dir') + 1];
+      mkdirSync(stateDir, { recursive: true });
+      writeFileSync(output, JSON.stringify({ items: [{
+        action: 'task_allow', candidateId: 'candidate_17',
+        idempotencyKey: 'action:${'b'.repeat(64)}', dispatchToken: 'PRIVATE_RECOVERY_TOKEN',
+        claimedAt: '2026-07-22T00:00:00.000Z', claimExpiresAt: '2026-07-22T00:02:00.000Z',
+        extra: true,
+      }] }));
+      chmodSync(output, 0o644);
+      process.stdout.write(JSON.stringify({ count: 1, items: [{
+        action: 'task_allow', candidateId: 'candidate_17',
+        idempotencyKey: 'action:${'b'.repeat(64)}',
+        claimedAt: '2026-07-22T00:00:00.000Z', claimExpiresAt: '2026-07-22T00:02:00.000Z',
+      }] }));
+    `);
+    await mkdir(stateDir, { recursive: true, mode: 0o700 });
+    const recover = createTaskActionRecoveryClaimer(config);
+    const error = await recover({
+      limit: 1, leaseMs: 120_000, now: '2026-07-22T00:00:00.000Z',
+    }).catch((caught) => caught);
+    expect(error).toMatchObject({ code: 'ERR_TASK_ACTION_SINK_PROTOCOL' });
+    expect(String(error)).not.toContain('PRIVATE_RECOVERY_TOKEN');
+    const remaining = await import('node:fs/promises').then(({ readdir }) => readdir(stateDir));
+    expect(remaining.filter((name) => name.startsWith('task-action-recovery-'))).toEqual([]);
+  });
   it('runs the narrow startup reconcile contract without exposing payloads', async () => {
-    const result = { eligible: 1, created: 1, existing: 0, items: [
+    const result = { eligible: 2, created: 2, existing: 0, items: [
       { candidateId: 'candidate_17', action: TASK_ALLOW_ACTION,
         idempotencyKey: 'action:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        state: 'pending' },
+      { candidateId: 'candidate_18', action: TASK_FEEDBACK_ACTION,
+        idempotencyKey: 'action:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
         state: 'pending' },
     ] };
     const { config } = await fixture(responder(result));
