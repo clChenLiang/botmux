@@ -1,9 +1,11 @@
-import { readFile } from 'node:fs/promises';
+import { lstat, readFile } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
 
 import type { TaskCandidateRecord } from './task-action-dispatch.js';
+import { atomicWriteFile } from '../utils/atomic-write.js';
+import { withFileLock } from '../utils/file-lock.js';
 
-const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const OPAQUE_ID = /^[A-Za-z0-9_][A-Za-z0-9._:-]{0,127}$/;
 const MAX_REGISTRY_BYTES = 4 * 1024 * 1024;
 const REQUIRED_RECORD_KEYS = [
   'candidateId', 'repositoryId', 'chatId', 'prompt', 'sourceRef',
@@ -12,6 +14,8 @@ const OPTIONAL_RECORD_KEYS = ['rootMessageId', 'originalSessionId'] as const;
 
 export interface TaskCandidateRegistry {
   resolve(candidateId: string): Promise<TaskCandidateRecord | undefined>;
+  persist(record: TaskCandidateRecord): Promise<'created' | 'duplicate'>;
+  bindRootMessage(candidateId: string, rootMessageId: string): Promise<'updated' | 'duplicate'>;
 }
 
 export function createTaskCandidateRegistry(registryPath: string): TaskCandidateRegistry {
@@ -21,30 +25,98 @@ export function createTaskCandidateRegistry(registryPath: string): TaskCandidate
   return {
     async resolve(candidateId) {
       if (!isOpaque(candidateId)) throw new Error('task candidate identifier invalid');
-      let raw: string;
-      try {
-        raw = await readFile(registryPath, { encoding: 'utf8' });
-      } catch (error: any) {
-        if (error?.code === 'ENOENT') return undefined;
-        throw new Error('task candidate registry unavailable');
-      }
-      if (Buffer.byteLength(raw) > MAX_REGISTRY_BYTES) {
-        throw new Error('task candidate registry invalid');
-      }
-      try {
-        const state = JSON.parse(raw) as unknown;
-        if (!isRecord(state) || !exactKeys(state, ['schemaVersion', 'candidates'])
-          || state.schemaVersion !== 1 || !isRecord(state.candidates)) {
-          throw new Error('invalid');
+      const state = await readState(registryPath, true);
+      if (!state) return undefined;
+      const entry = Object.prototype.hasOwnProperty.call(state.candidates, candidateId)
+        ? state.candidates[candidateId] : undefined;
+      if (entry === undefined) return undefined;
+      try { return parseRecord(entry, candidateId); } catch { throw new Error('task candidate registry invalid'); }
+    },
+    async persist(record) {
+      const parsed = parseRecord(record, record?.candidateId);
+      return withFileLock(registryPath, async () => {
+        const state = (await readState(registryPath, true)) ?? emptyState();
+        const existing = Object.prototype.hasOwnProperty.call(state.candidates, parsed.candidateId)
+          ? state.candidates[parsed.candidateId] : undefined;
+        if (existing !== undefined) {
+          let current: TaskCandidateRecord;
+          try { current = parseRecord(existing, parsed.candidateId); } catch { throw new Error('task candidate registry invalid'); }
+          const comparableCurrent = { ...current };
+          if (parsed.rootMessageId === undefined) delete comparableCurrent.rootMessageId;
+          if (parsed.originalSessionId === undefined) delete comparableCurrent.originalSessionId;
+          if (JSON.stringify(comparableCurrent) === JSON.stringify(parsed)) return 'duplicate';
+          throw new Error('task candidate registry conflict');
         }
-        const entry = state.candidates[candidateId];
-        if (entry === undefined) return undefined;
-        return parseRecord(entry, candidateId);
-      } catch {
-        throw new Error('task candidate registry invalid');
+        Object.defineProperty(state.candidates, parsed.candidateId, {
+          value: parsed, enumerable: true, configurable: true, writable: true,
+        });
+        await writeState(registryPath, state);
+        return 'created';
+      });
+    },
+    async bindRootMessage(candidateId, rootMessageId) {
+      if (!isOpaque(candidateId) || !isOpaque(rootMessageId)) {
+        throw new Error('task candidate identifier invalid');
       }
+      return withFileLock(registryPath, async () => {
+        const state = await readState(registryPath, false);
+        const existing = Object.prototype.hasOwnProperty.call(state.candidates, candidateId)
+          ? state.candidates[candidateId] : undefined;
+        if (existing === undefined) throw new Error('task candidate registry invalid');
+        let current: TaskCandidateRecord;
+        try { current = parseRecord(existing, candidateId); } catch { throw new Error('task candidate registry invalid'); }
+        if (current.rootMessageId === rootMessageId) return 'duplicate';
+        if (current.rootMessageId !== undefined) throw new Error('task candidate registry conflict');
+        Object.defineProperty(state.candidates, candidateId, {
+          value: { ...current, rootMessageId }, enumerable: true, configurable: true, writable: true,
+        });
+        await writeState(registryPath, state);
+        return 'updated';
+      });
     },
   };
+}
+
+interface RegistryState {
+  schemaVersion: 1;
+  candidates: Record<string, unknown>;
+}
+
+function emptyState(): RegistryState {
+  return { schemaVersion: 1, candidates: Object.create(null) as Record<string, unknown> };
+}
+
+async function readState(registryPath: string, allowMissing: true): Promise<RegistryState | undefined>;
+async function readState(registryPath: string, allowMissing: false): Promise<RegistryState>;
+async function readState(registryPath: string, allowMissing: boolean): Promise<RegistryState | undefined> {
+  let info;
+  try { info = await lstat(registryPath); } catch (error: any) {
+    if (error?.code === 'ENOENT' && allowMissing) return undefined;
+    throw new Error('task candidate registry unavailable');
+  }
+  if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.()
+    || (info.mode & 0o777) !== 0o600 || info.size > MAX_REGISTRY_BYTES) {
+    throw new Error('task candidate registry invalid');
+  }
+  let raw: string;
+  try { raw = await readFile(registryPath, 'utf8'); } catch { throw new Error('task candidate registry unavailable'); }
+  try {
+    const value = JSON.parse(raw) as unknown;
+    if (!isRecord(value) || !exactKeys(value, ['schemaVersion', 'candidates'])
+      || value.schemaVersion !== 1 || !isRecord(value.candidates)) throw new Error('invalid');
+    const candidates = Object.create(null) as Record<string, unknown>;
+    for (const key of Object.keys(value.candidates)) {
+      if (!isOpaque(key)) throw new Error('invalid');
+      Object.defineProperty(candidates, key, {
+        value: value.candidates[key], enumerable: true, configurable: true, writable: true,
+      });
+    }
+    return { schemaVersion: 1, candidates };
+  } catch { throw new Error('task candidate registry invalid'); }
+}
+
+async function writeState(registryPath: string, state: RegistryState): Promise<void> {
+  await atomicWriteFile(registryPath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
 }
 
 function parseRecord(value: unknown, candidateId: string): TaskCandidateRecord {

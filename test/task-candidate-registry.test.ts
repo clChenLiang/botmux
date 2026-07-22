@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -13,7 +13,8 @@ async function fixture(value: unknown) {
   const dir = await mkdtemp(join(tmpdir(), 'botmux-task-registry-'));
   dirs.push(dir);
   const path = join(dir, 'task-candidates.json');
-  await writeFile(path, JSON.stringify(value));
+  await writeFile(path, JSON.stringify(value), { mode: 0o600 });
+  await chmod(path, 0o600);
   return { path, registry: createTaskCandidateRegistry(path) };
 }
 
@@ -43,4 +44,3 @@ describe('createTaskCandidateRegistry', () => {
     await expect(registry.resolve('../candidate')).rejects.toThrow('task candidate identifier invalid');
   });
 });
-

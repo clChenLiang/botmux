@@ -53,6 +53,14 @@ describe('Slice C0 — chat side-effect isolation', () => {
     expect(out.stderr).toMatch(/refused inside workflow/);
   });
 
+  it('botmux task-card refuses when BOTMUX_WORKFLOW=1', () => {
+    const out = runCli(['task-card', 'send', 'candidate', '--input-file', '/tmp/input.json'], {
+      BOTMUX_WORKFLOW: '1',
+    });
+    expect(out.status).toBe(2);
+    expect(out.stderr).toMatch(/refused inside workflow/);
+  });
+
   it('botmux schedule add refuses when BOTMUX_WORKFLOW=1', () => {
     const out = runCli(['schedule', 'add', '@every', '1h', 'task'], {
       BOTMUX_WORKFLOW: '1',

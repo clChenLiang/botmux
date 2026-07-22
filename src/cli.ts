@@ -3998,6 +3998,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   status      查看 daemon 状态
   upgrade     升级到最新版本
   dashboard   打印新的 Web Dashboard 一次性登录 URL（旧 token 同时失效）
+  task-card send <candidate|completion|mr> --input-file <ABS>
+              从 BOTMUX_TASK_OS_STATE_DIR 的私有直属 JSON 文件发送任务卡片
   list        列出活跃会话（交互式选择并连接 tmux）
               --plain  纯文本表格输出（管道/脚本场景）
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
@@ -7241,7 +7243,7 @@ const command = process.argv[2];
 // reconcile.  Read-only commands (history, quoted, bots list, etc.)
 // stay allowed because they're useful for agents to introspect.
 if (process.env.BOTMUX_WORKFLOW === '1') {
-  const blockedRoot = new Set(['send', 'create-group', 'setup']);
+  const blockedRoot = new Set(['send', 'task-card', 'create-group', 'setup']);
   const isSchedule = command === 'schedule';
   const scheduleSub = isSchedule ? (process.argv[3] ?? '') : '';
   const blockedScheduleSub = new Set([
@@ -7883,6 +7885,14 @@ switch (command) {
     break;
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
+  case 'task-card': {
+    const { runTaskCardCommand } = await import('./cli/task-card.js');
+    const result = await runTaskCardCommand(process.argv.slice(3));
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    if (result.code !== 0) process.exitCode = result.code;
+    break;
+  }
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;
   case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;
