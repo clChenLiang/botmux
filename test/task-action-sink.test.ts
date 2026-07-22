@@ -8,6 +8,7 @@ import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
+  createTaskActionDispatchAcknowledger,
   createTaskActionSink,
   TaskActionSinkError,
 } from '../src/services/task-action-sink.js';
@@ -34,14 +35,15 @@ async function fixture(source: string, options: { timeoutMs?: number; maxOutputB
   const cliPath = join(directory, 'task os cli;$(touch SHOULD_NOT_EXIST).mjs');
   const stateDir = join(directory, 'state dir;$(touch ALSO_NOT_HERE)');
   await writeFile(cliPath, source, { mode: 0o700 });
-  const sink = createTaskActionSink({
+  const config = {
     nodeExecutable: process.execPath,
     taskOsCliPath: cliPath,
     stateDir,
     timeoutMs: options.timeoutMs ?? 2_000,
     maxOutputBytes: options.maxOutputBytes ?? 16_384,
-  });
-  return { directory, cliPath, stateDir, sink };
+  };
+  const sink = createTaskActionSink(config);
+  return { directory, cliPath, stateDir, config, sink };
 }
 
 const request = (overrides: Record<string, unknown> = {}) => ({
@@ -72,6 +74,7 @@ describe('createTaskActionSink', () => {
       process.stdout.write(JSON.stringify({
         outcome: 'recorded', effectiveAction: 'task_allow',
         triggerRequired: true, idempotencyKey: 'delivery.candidate_01',
+        dispatchToken: 'claim.candidate_01',
       }));
     `);
     process.env.BOTMUX_PRIVATE_ADAPTER_SECRET = 'DO_NOT_INHERIT_ME';
@@ -86,6 +89,7 @@ describe('createTaskActionSink', () => {
         effectiveAction: TASK_ALLOW_ACTION,
         triggerRequired: true,
         idempotencyKey: 'delivery.candidate_01',
+        dispatchToken: 'claim.candidate_01',
       });
     } finally {
       delete process.env.BOTMUX_PRIVATE_ADAPTER_SECRET;
@@ -109,8 +113,8 @@ describe('createTaskActionSink', () => {
   });
 
   it.each([
-    [{ outcome: 'recorded', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: true, idempotencyKey: 'delivery.c1' }],
-    [{ outcome: 'duplicate', effectiveAction: TASK_DISCUSS_ACTION, triggerRequired: true, idempotencyKey: 'delivery.c2' }],
+    [{ outcome: 'recorded', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: true, idempotencyKey: 'delivery.c1', dispatchToken: 'claim.c1' }],
+    [{ outcome: 'duplicate', effectiveAction: TASK_DISCUSS_ACTION, triggerRequired: true, idempotencyKey: 'delivery.c2', dispatchToken: 'claim.c2' }],
     [{ outcome: 'duplicate', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: false }],
     [{ outcome: 'conflict', effectiveAction: TASK_REJECT_ACTION, triggerRequired: false }],
     [{ outcome: 'recorded', effectiveAction: MR_IGNORE_ACTION, triggerRequired: false }],
@@ -131,10 +135,13 @@ describe('createTaskActionSink', () => {
     ['not-json PRIVATE_STDOUT', 'malformed JSON'],
     ['{}', 'missing fields'],
     [JSON.stringify({ outcome: 'recorded', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: false, extra: true }), 'extra field'],
-    [JSON.stringify({ outcome: 'recorded', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: true }), 'missing key'],
+    [JSON.stringify({ outcome: 'recorded', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: true, dispatchToken: 'claim.c1' }), 'missing key'],
+    [JSON.stringify({ outcome: 'recorded', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: true, idempotencyKey: 'delivery.c1' }), 'missing dispatch token'],
     [JSON.stringify({ outcome: 'recorded', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: false, idempotencyKey: 'x' }), 'unexpected key'],
-    [JSON.stringify({ outcome: 'recorded', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: true, idempotencyKey: '../unsafe' }), 'unsafe key'],
-    [JSON.stringify({ outcome: 'recorded', effectiveAction: MR_IGNORE_ACTION, triggerRequired: true, idempotencyKey: 'delivery.mr' }), 'invalid trigger action'],
+    [JSON.stringify({ outcome: 'recorded', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: false, dispatchToken: 'claim.c1' }), 'unexpected token'],
+    [JSON.stringify({ outcome: 'recorded', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: true, idempotencyKey: '../unsafe', dispatchToken: 'claim.c1' }), 'unsafe key'],
+    [JSON.stringify({ outcome: 'recorded', effectiveAction: TASK_ALLOW_ACTION, triggerRequired: true, idempotencyKey: 'delivery.c1', dispatchToken: '../unsafe' }), 'unsafe dispatch token'],
+    [JSON.stringify({ outcome: 'recorded', effectiveAction: MR_IGNORE_ACTION, triggerRequired: true, idempotencyKey: 'delivery.mr', dispatchToken: 'claim.mr' }), 'invalid trigger action'],
   ])('rejects %s protocol output without echoing private content (%s)', async (stdout) => {
     const { sink } = await fixture(`process.stdout.write(${JSON.stringify(stdout)});`);
     const error = await sink(request()).catch((caught) => caught);
@@ -262,6 +269,105 @@ describe('createTaskActionSink', () => {
     const error = await sink(request()).catch((caught) => caught);
     expect(error).toMatchObject({ code: 'ERR_TASK_ACTION_SINK_SPAWN' });
     expect(String(error)).not.toContain(directory);
+  });
+
+  describe('createTaskActionDispatchAcknowledger', () => {
+    it('invokes the exact fenced acknowledgement argv with the sanitized environment', async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'botmux-task-ack-'));
+      directories.push(directory);
+      const capture = join(directory, 'capture.json');
+      const cliPath = join(directory, 'task os ack cli;$(touch ACK_PWNED).mjs');
+      const stateDir = join(directory, 'ack state;$(touch ACK_STATE_PWNED)');
+      await writeFile(cliPath, `
+        import { writeFileSync } from 'node:fs';
+        writeFileSync(${JSON.stringify(capture)}, JSON.stringify({ argv: process.argv.slice(2), env: process.env }));
+        process.stdout.write(JSON.stringify({ outcome: 'dispatched', idempotencyKey: 'delivery.c1' }));
+      `);
+      process.env.BOTMUX_PRIVATE_ACK_SECRET = 'DO_NOT_INHERIT_ACK';
+      try {
+        const acknowledge = createTaskActionDispatchAcknowledger({
+          nodeExecutable: process.execPath,
+          taskOsCliPath: cliPath,
+          stateDir,
+        });
+        await expect(acknowledge({
+          idempotencyKey: 'delivery.c1',
+          dispatchToken: 'claim.c1',
+        })).resolves.toEqual({ outcome: 'dispatched', idempotencyKey: 'delivery.c1' });
+      } finally {
+        delete process.env.BOTMUX_PRIVATE_ACK_SECRET;
+      }
+      const captured = JSON.parse(await readFile(capture, 'utf8'));
+      expect(captured.argv).toEqual([
+        'task-action', 'dispatched',
+        '--state-dir', stateDir,
+        '--idempotency-key', 'delivery.c1',
+        '--dispatch-token', 'claim.c1',
+        '--json',
+      ]);
+      expect(captured.env.BOTMUX_PRIVATE_ACK_SECRET).toBeUndefined();
+      expect(captured.env).toMatchObject({ LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' });
+    });
+
+    it.each(['dispatched', 'duplicate'] as const)('accepts a matching %s result', async (outcome) => {
+      const { config } = await fixture(responder({ outcome, idempotencyKey: 'delivery.c1' }));
+      const acknowledge = createTaskActionDispatchAcknowledger(config);
+      await expect(acknowledge({
+        idempotencyKey: 'delivery.c1', dispatchToken: 'claim.c1',
+      })).resolves.toEqual({ outcome, idempotencyKey: 'delivery.c1' });
+    });
+
+    it.each([
+      '',
+      'PRIVATE_ACK_NOT_JSON',
+      JSON.stringify({ outcome: 'unknown', idempotencyKey: 'delivery.c1' }),
+      JSON.stringify({ outcome: 'dispatched', idempotencyKey: 'delivery.other' }),
+      JSON.stringify({ outcome: 'dispatched', idempotencyKey: 'delivery.c1', extra: true }),
+      JSON.stringify({ outcome: 'dispatched', idempotencyKey: '../unsafe' }),
+    ])('rejects hostile or malformed acknowledgement output', async (stdout) => {
+      const { config } = await fixture(`process.stdout.write(${JSON.stringify(stdout)});`);
+      const acknowledge = createTaskActionDispatchAcknowledger(config);
+      const error = await acknowledge({
+        idempotencyKey: 'delivery.c1', dispatchToken: 'claim.c1',
+      }).catch((caught) => caught);
+      expect(error).toMatchObject({ code: 'ERR_TASK_ACTION_SINK_PROTOCOL' });
+      expect(String(error)).not.toContain('PRIVATE_ACK');
+    });
+
+    it.each([
+      [{ idempotencyKey: 'delivery.c1' }, 'missing token'],
+      [{ idempotencyKey: '../unsafe', dispatchToken: 'claim.c1' }, 'unsafe key'],
+      [{ idempotencyKey: 'delivery.c1', dispatchToken: '../unsafe' }, 'unsafe token'],
+      [{ idempotencyKey: 'delivery.c1', dispatchToken: 'claim.c1', extra: true }, 'extra'],
+      [Object.defineProperty({}, 'dispatchToken', { get() { throw new Error('PRIVATE_ACK_GETTER'); } }), 'accessor'],
+      [new Proxy({}, { ownKeys() { throw new Error('PRIVATE_ACK_PROXY'); } }), 'proxy'],
+    ])('rejects hostile acknowledgement input', async (input) => {
+      const { config } = await fixture(responder({ outcome: 'dispatched', idempotencyKey: 'delivery.c1' }));
+      const acknowledge = createTaskActionDispatchAcknowledger(config);
+      const error = await acknowledge(input as any).catch((caught) => caught);
+      expect(error).toMatchObject({ code: 'ERR_TASK_ACTION_SINK_INPUT' });
+      expect(String(error)).not.toContain('PRIVATE_ACK');
+    });
+
+    it.each(['timeout', 'output'] as const)('reuses bounded %s process handling', async (failure) => {
+      const source = failure === 'timeout'
+        ? 'setInterval(() => {}, 1_000);'
+        : "process.stdout.write('PRIVATE_ACK_OUTPUT'.repeat(200)); setInterval(() => {}, 1_000);";
+      const { config } = await fixture(source, {
+        timeoutMs: failure === 'timeout' ? 20 : 2_000,
+        maxOutputBytes: 64,
+      });
+      const acknowledge = createTaskActionDispatchAcknowledger(config);
+      const error = await acknowledge({
+        idempotencyKey: 'delivery.c1', dispatchToken: 'claim.c1',
+      }).catch((caught) => caught);
+      expect(error).toMatchObject({
+        code: failure === 'timeout'
+          ? 'ERR_TASK_ACTION_SINK_TIMEOUT'
+          : 'ERR_TASK_ACTION_SINK_OUTPUT',
+      });
+      expect(String(error)).not.toContain('PRIVATE_ACK_OUTPUT');
+    });
   });
 
   it.each([

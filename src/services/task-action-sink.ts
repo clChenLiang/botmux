@@ -28,6 +28,16 @@ export interface TaskActionSinkRuntime {
   platform: NodeJS.Platform;
 }
 
+export interface TaskActionDispatchAcknowledgementRequest {
+  idempotencyKey: string;
+  dispatchToken: string;
+}
+
+export interface TaskActionDispatchAcknowledgementResult {
+  outcome: 'dispatched' | 'duplicate';
+  idempotencyKey: string;
+}
+
 type TaskActionSinkErrorCode =
   | 'ERR_TASK_ACTION_SINK_CONFIG'
   | 'ERR_TASK_ACTION_SINK_INPUT'
@@ -92,8 +102,37 @@ export function createTaskActionSink(
 
   return async (untrustedRequest) => {
     const request = parseRequest(untrustedRequest);
-    const stdout = await invokeTaskOs(config, request, runtime);
+    const stdout = await invokeTaskOs(config, [
+      'task-action', 'apply',
+      '--state-dir', config.stateDir,
+      '--action', request.action,
+      '--subject-type', request.subject.type,
+      '--subject-id', request.subject.id,
+      '--operator-open-id', request.operatorOpenId,
+      '--json',
+    ], runtime);
     return parseResult(stdout, request);
+  };
+}
+
+/** Create the fenced completion callback for a successfully dispatched claim. */
+export function createTaskActionDispatchAcknowledger(
+  untrustedConfig: TaskActionSinkConfig,
+  runtime: TaskActionSinkRuntime = DEFAULT_RUNTIME,
+): (
+  request: TaskActionDispatchAcknowledgementRequest,
+) => Promise<TaskActionDispatchAcknowledgementResult> {
+  const config = parseConfig(untrustedConfig);
+  return async (untrustedRequest) => {
+    const request = parseAcknowledgementRequest(untrustedRequest);
+    const stdout = await invokeTaskOs(config, [
+      'task-action', 'dispatched',
+      '--state-dir', config.stateDir,
+      '--idempotency-key', request.idempotencyKey,
+      '--dispatch-token', request.dispatchToken,
+      '--json',
+    ], runtime);
+    return parseAcknowledgementResult(stdout, request);
   };
 }
 
@@ -152,21 +191,26 @@ function compatible(action: string, subjectType: unknown): boolean {
   return false;
 }
 
+function parseAcknowledgementRequest(value: unknown): TaskActionDispatchAcknowledgementRequest {
+  try {
+    const data = exactDataRecord(value, ['idempotencyKey', 'dispatchToken'], [
+      'idempotencyKey', 'dispatchToken',
+    ]);
+    if (!isOpaqueId(data.idempotencyKey) || !isOpaqueId(data.dispatchToken)) {
+      throw new Error('invalid acknowledgement identifier');
+    }
+    return { idempotencyKey: data.idempotencyKey, dispatchToken: data.dispatchToken };
+  } catch {
+    throw new TaskActionSinkError('ERR_TASK_ACTION_SINK_INPUT');
+  }
+}
+
 function invokeTaskOs(
   config: SafeConfig,
-  request: TaskActionPersistenceRequest,
+  commandArgs: string[],
   runtime: TaskActionSinkRuntime,
 ): Promise<string> {
-  const args = [
-    config.taskOsCliPath,
-    'task-action', 'apply',
-    '--state-dir', config.stateDir,
-    '--action', request.action,
-    '--subject-type', request.subject.type,
-    '--subject-id', request.subject.id,
-    '--operator-open-id', request.operatorOpenId,
-    '--json',
-  ];
+  const args = [config.taskOsCliPath, ...commandArgs];
 
   return new Promise((resolve, reject) => {
     let child: ChildProcess;
@@ -305,7 +349,7 @@ function parseResult(
   try {
     const parsed: unknown = JSON.parse(stdout);
     const base = exactDataRecord(parsed, [
-      'outcome', 'effectiveAction', 'triggerRequired', 'idempotencyKey',
+      'outcome', 'effectiveAction', 'triggerRequired', 'idempotencyKey', 'dispatchToken',
     ], ['outcome', 'effectiveAction', 'triggerRequired']);
     if (base.outcome !== 'recorded' && base.outcome !== 'duplicate' && base.outcome !== 'conflict') {
       throw new Error('invalid outcome');
@@ -327,9 +371,10 @@ function parseResult(
     if (typeof base.triggerRequired !== 'boolean') throw new Error('invalid trigger flag');
 
     if (base.triggerRequired) {
-      if (Reflect.ownKeys(base).length !== 4
+      if (Reflect.ownKeys(base).length !== 5
         || !TRIGGER_ACTIONS.has(base.effectiveAction)
-        || !isOpaqueId(base.idempotencyKey)) {
+        || !isOpaqueId(base.idempotencyKey)
+        || !isOpaqueId(base.dispatchToken)) {
         throw new Error('invalid trigger result');
       }
       return {
@@ -337,6 +382,7 @@ function parseResult(
         effectiveAction: base.effectiveAction as TaskActionPersistenceResult['effectiveAction'],
         triggerRequired: true,
         idempotencyKey: base.idempotencyKey,
+        dispatchToken: base.dispatchToken,
       };
     }
     if (Reflect.ownKeys(base).length !== 3) throw new Error('unexpected result field');
@@ -345,6 +391,27 @@ function parseResult(
       effectiveAction: base.effectiveAction as TaskActionPersistenceResult['effectiveAction'],
       triggerRequired: false,
     };
+  } catch {
+    throw new TaskActionSinkError('ERR_TASK_ACTION_SINK_PROTOCOL');
+  }
+}
+
+function parseAcknowledgementResult(
+  stdout: string,
+  request: TaskActionDispatchAcknowledgementRequest,
+): TaskActionDispatchAcknowledgementResult {
+  try {
+    const parsed: unknown = JSON.parse(stdout);
+    const data = exactDataRecord(parsed, ['outcome', 'idempotencyKey'], [
+      'outcome', 'idempotencyKey',
+    ]);
+    if (data.outcome !== 'dispatched' && data.outcome !== 'duplicate') {
+      throw new Error('invalid acknowledgement outcome');
+    }
+    if (!isOpaqueId(data.idempotencyKey) || data.idempotencyKey !== request.idempotencyKey) {
+      throw new Error('mismatched acknowledgement');
+    }
+    return { outcome: data.outcome, idempotencyKey: data.idempotencyKey };
   } catch {
     throw new TaskActionSinkError('ERR_TASK_ACTION_SINK_PROTOCOL');
   }
