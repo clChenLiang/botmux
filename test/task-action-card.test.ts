@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   MR_IGNORE_ACTION,
+  MR_KEEP_WATCHING_ACTION,
   REPOSITORY_IGNORE_ACTION,
   TASK_ALLOW_ACTION,
   TASK_DISCUSS_ACTION,
@@ -13,6 +14,37 @@ import {
 } from '../src/im/lark/task-action-card.js';
 
 type Card = Record<string, any>;
+
+const CANDIDATE = {
+  candidateId: 'candidate_01JZ8N9QG5',
+  title: '修复结算页',
+  summary: '购买完成后页面展示错误。',
+  source: '飞书产品反馈群',
+  recommendationReason: '影响核心支付链路，且修复范围明确。',
+  repositoryLabel: 'marketplace',
+  risk: '可能影响旧订单回显。',
+  validationMethod: '运行结算回归测试，并在 PPE 验证新旧订单。',
+};
+
+const COMPLETION = {
+  candidateId: CANDIDATE.candidateId,
+  title: '结算页修复完成',
+  environment: 'PPE · China-North · marketplace',
+  prdUrl: 'https://bytedance.larkoffice.com/docx/prd_1',
+  testReportUrl: 'https://bytedance.larkoffice.com/docx/test_1',
+  mrUrl: 'https://code.byted.org/group/repo/merge_requests/17',
+  diffScreenshotUrl: 'https://bytedance.larkoffice.com/file/diff_1',
+  previewUrl: 'https://preview.example.com/build/17',
+  ppeUrl: 'https://ppe.example.com/build/17',
+};
+
+const MR = {
+  mrId: 'mr_23817',
+  repositoryId: 'repo_marketplace',
+  title: 'MR !23817 需要处理',
+  summary: '流水线失败',
+  repositoryLabel: 'marketplace',
+};
 
 function parse(card: string): Card {
   return JSON.parse(card);
@@ -41,122 +73,181 @@ function actionMap(card: Card): Map<string, { label: string; value: Record<strin
   }));
 }
 
-describe('task action cards', () => {
-  it('builds a deterministic Lark v2 candidate card with allow, reject and discuss actions', () => {
-    const input = {
-      candidateId: 'candidate_01JZ8N9QG5',
-      title: '修复结算页',
-      summary: '来源于产品反馈',
-      repositoryLabel: 'marketplace',
-    };
+function markdown(card: Card): string[] {
+  return card.body.elements.filter((element: any) => element.tag === 'markdown')
+    .map((element: any) => element.content);
+}
 
-    const first = buildTaskCandidateCard(input);
-    const second = buildTaskCandidateCard({ ...input });
-    expect(first).toBe(second);
+describe('task action cards', () => {
+  it('renders every required candidate field and the three decision actions', () => {
+    const first = buildTaskCandidateCard(CANDIDATE);
+    expect(first).toBe(buildTaskCandidateCard({ ...CANDIDATE }));
 
     const card = parse(first);
     expect(card.schema).toBe('2.0');
     expect(card.config).toEqual({ update_multi: true });
-    const actions = actionMap(card);
-    expect([...actions.keys()]).toEqual([
-      TASK_ALLOW_ACTION,
-      TASK_REJECT_ACTION,
-      TASK_DISCUSS_ACTION,
+    expect(markdown(card)).toEqual([
+      '**标题**\n修复结算页',
+      '**摘要**\n购买完成后页面展示错误。',
+      '**来源**\n飞书产品反馈群',
+      '**推荐理由**\n影响核心支付链路，且修复范围明确。',
+      '**仓库**\nmarketplace',
+      '**风险**\n可能影响旧订单回显。',
+      '**预估验证方式**\n运行结算回归测试，并在 PPE 验证新旧订单。',
     ]);
+
+    const actions = actionMap(card);
+    expect([...actions.keys()]).toEqual([TASK_ALLOW_ACTION, TASK_REJECT_ACTION, TASK_DISCUSS_ACTION]);
     expect([...actions.values()].map((item) => item.label)).toEqual(['允许', '拒绝', '细聊']);
     for (const { value } of actions.values()) {
-      expect(value).toEqual({ action: value.action, candidateId: input.candidateId });
+      expect(value).toEqual({ action: value.action, candidateId: CANDIDATE.candidateId });
     }
   });
 
-  it('builds a completion card with only the feedback action', () => {
-    const card = parse(buildTaskCompletionCard({
-      candidateId: 'candidate_01JZ8N9QG5',
-      title: '结算页修复完成',
-      summary: '已完成测试并部署 PPE',
-    }));
+  it('requires every structured candidate field', () => {
+    for (const field of ['candidateId', 'title', 'summary', 'source', 'recommendationReason', 'repositoryLabel', 'risk', 'validationMethod']) {
+      const input = { ...CANDIDATE } as Record<string, unknown>;
+      delete input[field];
+      expect(() => buildTaskCandidateCard(input as any), field).toThrow(new RegExp(field));
+    }
+  });
 
+  it('renders all completion evidence as labeled active HTTPS links and one-line environment', () => {
+    const card = parse(buildTaskCompletionCard(COMPLETION));
+    expect(markdown(card)).toEqual([
+      '**标题**\n结算页修复完成',
+      '**运行环境**\nPPE · China-North · marketplace',
+      '**交付材料**',
+      '[产品需求](https://bytedance.larkoffice.com/docx/prd_1)',
+      '[测试报告](https://bytedance.larkoffice.com/docx/test_1)',
+      '[MR](https://code.byted.org/group/repo/merge_requests/17)',
+      '[diff 截图](https://bytedance.larkoffice.com/file/diff_1)',
+      '[Preview](https://preview.example.com/build/17)',
+      '[PPE](https://ppe.example.com/build/17)',
+    ]);
     const actions = actionMap(card);
     expect([...actions.keys()]).toEqual([TASK_FEEDBACK_ACTION]);
     expect(actions.get(TASK_FEEDBACK_ACTION)).toEqual({
       label: '阅读反馈',
-      value: { action: TASK_FEEDBACK_ACTION, candidateId: 'candidate_01JZ8N9QG5' },
+      value: { action: TASK_FEEDBACK_ACTION, candidateId: CANDIDATE.candidateId },
     });
+    expect(JSON.stringify([...actions.values()])).not.toContain('https://');
   });
 
-  it('builds an MR card with independently scoped MR and repository ignore actions', () => {
-    const card = parse(buildMrAttentionCard({
-      mrId: 'mr_23817',
-      repositoryId: 'repo_marketplace',
-      title: 'MR !23817 需要处理',
-      summary: '流水线失败',
-      repositoryLabel: 'marketplace',
+  it('requires every completion link and runtime environment', () => {
+    for (const field of ['candidateId', 'title', 'environment', 'prdUrl', 'testReportUrl', 'mrUrl', 'diffScreenshotUrl', 'previewUrl', 'ppeUrl']) {
+      const input = { ...COMPLETION } as Record<string, unknown>;
+      delete input[field];
+      expect(() => buildTaskCompletionCard(input as any), field).toThrow(new RegExp(field));
+    }
+  });
+
+  it('rejects non-HTTPS, credential-bearing and markdown-shaped completion URLs', () => {
+    for (const prdUrl of [
+      'http://example.com/prd',
+      'javascript:alert(1)',
+      'https://user:secret@example.com/prd',
+      '[fake](https://evil.example/prd)',
+      'https://example.com/prd\n[evil](https://evil.example)',
+      'https://example.com/\u202Efdp.exe',
+    ]) {
+      expect(() => buildTaskCompletionCard({ ...COMPLETION, prdUrl }), prdUrl).toThrow(/prdUrl/);
+    }
+  });
+
+  it('percent-encodes markdown delimiters in otherwise valid HTTPS URLs', () => {
+    const card = parse(buildTaskCompletionCard({
+      ...COMPLETION,
+      diffScreenshotUrl: 'https://files.example.com/diff_(17).png',
     }));
+    expect(markdown(card)).toContain('[diff 截图](https://files.example.com/diff_%2817%29.png)');
+  });
 
-    const actions = actionMap(card);
-    expect([...actions.keys()]).toEqual([MR_IGNORE_ACTION, REPOSITORY_IGNORE_ACTION]);
-    expect(actions.get(MR_IGNORE_ACTION)).toEqual({
-      label: '不再关注此 MR',
-      value: { action: MR_IGNORE_ACTION, mrId: 'mr_23817' },
+  it('renders continue watching before independently scoped MR and repository ignore actions', () => {
+    const actions = actionMap(parse(buildMrAttentionCard(MR)));
+    expect([...actions.keys()]).toEqual([
+      MR_KEEP_WATCHING_ACTION,
+      MR_IGNORE_ACTION,
+      REPOSITORY_IGNORE_ACTION,
+    ]);
+    expect([...actions.values()].map((item) => item.label)).toEqual([
+      '继续关注',
+      '不再关注此 MR',
+      '不再关注此仓库',
+    ]);
+    expect(actions.get(MR_KEEP_WATCHING_ACTION)?.value).toEqual({
+      action: MR_KEEP_WATCHING_ACTION,
+      mrId: MR.mrId,
     });
-    expect(actions.get(REPOSITORY_IGNORE_ACTION)).toEqual({
-      label: '不再关注此仓库',
-      value: { action: REPOSITORY_IGNORE_ACTION, repositoryId: 'repo_marketplace' },
+    expect(actions.get(MR_IGNORE_ACTION)?.value).toEqual({ action: MR_IGNORE_ACTION, mrId: MR.mrId });
+    expect(actions.get(REPOSITORY_IGNORE_ACTION)?.value).toEqual({
+      action: REPOSITORY_IGNORE_ACTION,
+      repositoryId: MR.repositoryId,
     });
   });
 
-  it('keeps callback values opaque and excludes paths, source text, user identity and secrets', () => {
-    const sensitive = {
-      candidateId: 'candidate_opaque_7',
-      title: '处理 OAuth 异常',
-      summary: '原始需求正文 SECRET_BODY',
-      repositoryLabel: 'agent-monorepo',
-    };
-    const card = parse(buildTaskCandidateCard(sensitive));
-
-    const serializedValues = JSON.stringify(buttons(card).map(callbackValue));
-    expect(serializedValues).toBe(JSON.stringify([
-      { action: TASK_ALLOW_ACTION, candidateId: sensitive.candidateId },
-      { action: TASK_REJECT_ACTION, candidateId: sensitive.candidateId },
-      { action: TASK_DISCUSS_ACTION, candidateId: sensitive.candidateId },
-    ]));
-    expect(serializedValues).not.toMatch(/SECRET_BODY|agent-monorepo|chenliang|\/home\/|prompt|source|secret/i);
+  it('requires every MR card field', () => {
+    for (const field of ['mrId', 'repositoryId', 'title', 'summary', 'repositoryLabel']) {
+      const input = { ...MR } as Record<string, unknown>;
+      delete input[field];
+      expect(() => buildMrAttentionCard(input as any), field).toThrow(new RegExp(field));
+    }
   });
 
-  it('escapes display markdown and does not retain mutable caller data', () => {
+  it('keeps callback values opaque and excludes content, paths, user identity and secrets', () => {
+    const values = buttons(parse(buildTaskCandidateCard({
+      ...CANDIDATE,
+      summary: 'SECRET_BODY /home/chenliang.zy/Code/marketplace',
+    }))).map(callbackValue);
+    expect(values).toEqual([
+      { action: TASK_ALLOW_ACTION, candidateId: CANDIDATE.candidateId },
+      { action: TASK_REJECT_ACTION, candidateId: CANDIDATE.candidateId },
+      { action: TASK_DISCUSS_ACTION, candidateId: CANDIDATE.candidateId },
+    ]);
+    expect(JSON.stringify(values)).not.toMatch(/SECRET_BODY|marketplace|chenliang|\/home\/|prompt|source|secret/i);
+  });
+
+  it('escapes multiline display markdown and returns data detached from caller input', () => {
     const input = {
-      candidateId: 'candidate_detached',
-      title: '标题 *bold* <at id=all></at>',
-      summary: '正文 `code` [link](https://invalid.example)',
-      repositoryLabel: 'repo_[prod]',
+      ...CANDIDATE,
+      summary: '正文 `code`\n[link](https://invalid.example)',
+      recommendationReason: '优先级 *high*',
     };
     const cardText = buildTaskCandidateCard(input);
-    input.title = 'mutated';
     input.summary = 'mutated';
-
-    const card = parse(cardText);
-    const display = JSON.stringify(card.body.elements);
-    expect(display).toContain('\\\\*bold\\\\*');
-    expect(display).toContain('&lt;at id=all&gt;&lt;/at&gt;');
+    const display = JSON.stringify(parse(cardText).body.elements);
     expect(display).toContain('\\\\`code\\\\`');
     expect(display).toContain('\\\\[link\\\\]');
+    expect(display).toContain('\\\\*high\\\\*');
     expect(display).not.toContain('mutated');
   });
 
-  it.each([
-    '',
-    '../repo',
-    '/home/chenliang.zy/Code/repo',
-    'contains space',
-    'line\nbreak',
-    'x'.repeat(129),
-  ])('rejects unsafe opaque identifier %j', (candidateId) => {
-    expect(() => buildTaskCandidateCard({ candidateId, title: 'title', summary: 'summary' }))
-      .toThrow(/candidateId/);
+  it.each(['', '../repo', '/home/user/repo', 'contains space', 'line\nbreak', 'x'.repeat(129)])(
+    'rejects unsafe opaque identifier %j',
+    (candidateId) => {
+      expect(() => buildTaskCandidateCard({ ...CANDIDATE, candidateId })).toThrow(/candidateId/);
+    },
+  );
+
+  it.each(['title', 'source', 'repositoryLabel'] as const)(
+    'rejects multiline and invisible formatting in single-line candidate field %s',
+    (field) => {
+      expect(() => buildTaskCandidateCard({ ...CANDIDATE, [field]: 'safe\nspoofed' })).toThrow(new RegExp(field));
+      expect(() => buildTaskCandidateCard({ ...CANDIDATE, [field]: 'safe\tspoofed' })).toThrow(new RegExp(field));
+      expect(() => buildTaskCandidateCard({ ...CANDIDATE, [field]: 'safe\u200Bspoofed' })).toThrow(new RegExp(field));
+    },
+  );
+
+  it('rejects multiline or invisible formatting in completion labels and environment', () => {
+    expect(() => buildTaskCompletionCard({ ...COMPLETION, title: 'done\rspoofed' })).toThrow(/title/);
+    expect(() => buildTaskCompletionCard({ ...COMPLETION, environment: 'PPE\u2060spoofed' })).toThrow(/environment/);
   });
 
-  it('rejects invalid display text instead of emitting ambiguous card content', () => {
-    expect(() => buildTaskCompletionCard({ candidateId: 'candidate_ok', title: 'x\u0000y', summary: 'ok' }))
-      .toThrow(/title/);
-  });
+  it.each(['summary', 'recommendationReason', 'risk', 'validationMethod'] as const)(
+    'allows multiline prose but rejects bidi controls in %s',
+    (field) => {
+      expect(() => buildTaskCandidateCard({ ...CANDIDATE, [field]: 'line one\nline two' })).not.toThrow();
+      expect(() => buildTaskCandidateCard({ ...CANDIDATE, [field]: 'safe\u202Espoofed' })).toThrow(new RegExp(field));
+    },
+  );
 });
