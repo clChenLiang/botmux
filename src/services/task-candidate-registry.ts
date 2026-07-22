@@ -1,9 +1,15 @@
-import { lstat, readFile } from 'node:fs/promises';
-import { isAbsolute } from 'node:path';
+import { dirname, isAbsolute } from 'node:path';
 
 import type { TaskCandidateRecord } from './task-action-dispatch.js';
-import { atomicWriteFile } from '../utils/atomic-write.js';
 import { withFileLock } from '../utils/file-lock.js';
+import {
+  durablePrivateWrite,
+  pinPrivateStateDirectory,
+  readPrivateFile,
+  type PrivateFileIdentity,
+  type PrivateStateDirectory,
+  type PrivateStateHooks,
+} from './private-task-state.js';
 
 const OPAQUE_ID = /^[A-Za-z0-9_][A-Za-z0-9._:-]{0,127}$/;
 const MAX_REGISTRY_BYTES = 4 * 1024 * 1024;
@@ -18,24 +24,31 @@ export interface TaskCandidateRegistry {
   bindRootMessage(candidateId: string, rootMessageId: string): Promise<'updated' | 'duplicate'>;
 }
 
-export function createTaskCandidateRegistry(registryPath: string): TaskCandidateRegistry {
+export function createTaskCandidateRegistry(
+  registryPath: string,
+  options: { privateStateHooks?: PrivateStateHooks } = {},
+): TaskCandidateRegistry {
   if (typeof registryPath !== 'string' || !isAbsolute(registryPath)) {
     throw new Error('task candidate registry path invalid');
   }
   return {
     async resolve(candidateId) {
       if (!isOpaque(candidateId)) throw new Error('task candidate identifier invalid');
-      const state = await readState(registryPath, true);
-      if (!state) return undefined;
-      const entry = Object.prototype.hasOwnProperty.call(state.candidates, candidateId)
-        ? state.candidates[candidateId] : undefined;
-      if (entry === undefined) return undefined;
-      try { return parseRecord(entry, candidateId); } catch { throw new Error('task candidate registry invalid'); }
+      return withGuard(registryPath, async (guard) => {
+        const loaded = await readState(registryPath, true, guard, options.privateStateHooks);
+        if (!loaded) return undefined;
+        const entry = Object.prototype.hasOwnProperty.call(loaded.state.candidates, candidateId)
+          ? loaded.state.candidates[candidateId] : undefined;
+        if (entry === undefined) return undefined;
+        try { return parseRecord(entry, candidateId); } catch { throw new Error('task candidate registry invalid'); }
+      });
     },
     async persist(record) {
       const parsed = parseRecord(record, record?.candidateId);
-      return withFileLock(registryPath, async () => {
-        const state = (await readState(registryPath, true)) ?? emptyState();
+      return withGuard(registryPath, async (guard) => withFileLock(registryPath, async () => {
+        await guard.revalidate();
+        const loaded = await readState(registryPath, true, guard, options.privateStateHooks);
+        const state = loaded?.state ?? emptyState();
         const existing = Object.prototype.hasOwnProperty.call(state.candidates, parsed.candidateId)
           ? state.candidates[parsed.candidateId] : undefined;
         if (existing !== undefined) {
@@ -50,16 +63,19 @@ export function createTaskCandidateRegistry(registryPath: string): TaskCandidate
         Object.defineProperty(state.candidates, parsed.candidateId, {
           value: parsed, enumerable: true, configurable: true, writable: true,
         });
-        await writeState(registryPath, state);
+        await writeState(registryPath, state, guard, options.privateStateHooks, loaded?.identity ?? null);
+        await guard.revalidate();
         return 'created';
-      });
+      }));
     },
     async bindRootMessage(candidateId, rootMessageId) {
       if (!isOpaque(candidateId) || !isOpaque(rootMessageId)) {
         throw new Error('task candidate identifier invalid');
       }
-      return withFileLock(registryPath, async () => {
-        const state = await readState(registryPath, false);
+      return withGuard(registryPath, async (guard) => withFileLock(registryPath, async () => {
+        await guard.revalidate();
+        const loaded = await readState(registryPath, false, guard, options.privateStateHooks);
+        const state = loaded.state;
         const existing = Object.prototype.hasOwnProperty.call(state.candidates, candidateId)
           ? state.candidates[candidateId] : undefined;
         if (existing === undefined) throw new Error('task candidate registry invalid');
@@ -70,9 +86,10 @@ export function createTaskCandidateRegistry(registryPath: string): TaskCandidate
         Object.defineProperty(state.candidates, candidateId, {
           value: { ...current, rootMessageId }, enumerable: true, configurable: true, writable: true,
         });
-        await writeState(registryPath, state);
+        await writeState(registryPath, state, guard, options.privateStateHooks, loaded.identity);
+        await guard.revalidate();
         return 'updated';
-      });
+      }));
     },
   };
 }
@@ -86,22 +103,34 @@ function emptyState(): RegistryState {
   return { schemaVersion: 1, candidates: Object.create(null) as Record<string, unknown> };
 }
 
-async function readState(registryPath: string, allowMissing: true): Promise<RegistryState | undefined>;
-async function readState(registryPath: string, allowMissing: false): Promise<RegistryState>;
-async function readState(registryPath: string, allowMissing: boolean): Promise<RegistryState | undefined> {
-  let info;
-  try { info = await lstat(registryPath); } catch (error: any) {
-    if (error?.code === 'ENOENT' && allowMissing) return undefined;
-    throw new Error('task candidate registry unavailable');
-  }
-  if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.()
-    || (info.mode & 0o777) !== 0o600 || info.size > MAX_REGISTRY_BYTES) {
-    throw new Error('task candidate registry invalid');
-  }
-  let raw: string;
-  try { raw = await readFile(registryPath, 'utf8'); } catch { throw new Error('task candidate registry unavailable'); }
+interface LoadedRegistry {
+  state: RegistryState;
+  identity: PrivateFileIdentity;
+}
+
+async function readState(
+  registryPath: string,
+  allowMissing: true,
+  guard: PrivateStateDirectory,
+  hooks?: PrivateStateHooks,
+): Promise<LoadedRegistry | undefined>;
+async function readState(
+  registryPath: string,
+  allowMissing: false,
+  guard: PrivateStateDirectory,
+  hooks?: PrivateStateHooks,
+): Promise<LoadedRegistry>;
+async function readState(
+  registryPath: string,
+  allowMissing: boolean,
+  guard: PrivateStateDirectory,
+  hooks: PrivateStateHooks = {},
+): Promise<LoadedRegistry | undefined> {
+  const snapshot = await readPrivateFile(registryPath, MAX_REGISTRY_BYTES, allowMissing, guard, hooks)
+    .catch(() => { throw new Error('task candidate registry invalid'); });
+  if (!snapshot) return undefined;
   try {
-    const value = JSON.parse(raw) as unknown;
+    const value = JSON.parse(snapshot.raw) as unknown;
     if (!isRecord(value) || !exactKeys(value, ['schemaVersion', 'candidates'])
       || value.schemaVersion !== 1 || !isRecord(value.candidates)) throw new Error('invalid');
     const candidates = Object.create(null) as Record<string, unknown>;
@@ -111,12 +140,34 @@ async function readState(registryPath: string, allowMissing: boolean): Promise<R
         value: value.candidates[key], enumerable: true, configurable: true, writable: true,
       });
     }
-    return { schemaVersion: 1, candidates };
+    return {
+      state: { schemaVersion: 1, candidates },
+      identity: { device: snapshot.device, inode: snapshot.inode },
+    };
   } catch { throw new Error('task candidate registry invalid'); }
 }
 
-async function writeState(registryPath: string, state: RegistryState): Promise<void> {
-  await atomicWriteFile(registryPath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+async function writeState(
+  registryPath: string,
+  state: RegistryState,
+  guard: PrivateStateDirectory,
+  hooks: PrivateStateHooks | undefined,
+  expected: PrivateFileIdentity | null,
+): Promise<void> {
+  await durablePrivateWrite(registryPath, `${JSON.stringify(state)}\n`, guard, hooks, expected);
+}
+
+async function withGuard<T>(
+  registryPath: string,
+  operation: (guard: PrivateStateDirectory) => Promise<T>,
+): Promise<T> {
+  let guard: PrivateStateDirectory;
+  try { guard = await pinPrivateStateDirectory(dirname(registryPath)); } catch {
+    throw new Error('task candidate registry invalid');
+  }
+  try { return await operation(guard); } finally {
+    await guard.close().catch(() => { throw new Error('task candidate registry invalid'); });
+  }
 }
 
 function parseRecord(value: unknown, candidateId: string): TaskCandidateRecord {

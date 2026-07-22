@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -10,7 +10,7 @@ const dirs: string[] = [];
 afterEach(async () => Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))));
 
 async function fixture(value: unknown) {
-  const dir = await mkdtemp(join(tmpdir(), 'botmux-task-registry-'));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'botmux-task-registry-')));
   dirs.push(dir);
   const path = join(dir, 'task-candidates.json');
   await writeFile(path, JSON.stringify(value), { mode: 0o600 });

@@ -1,9 +1,15 @@
 import { createHash } from 'node:crypto';
-import { lstat, readFile } from 'node:fs/promises';
-import { isAbsolute } from 'node:path';
+import { dirname, isAbsolute } from 'node:path';
 
-import { atomicWriteFile } from '../utils/atomic-write.js';
 import { withFileLock } from '../utils/file-lock.js';
+import {
+  durablePrivateWrite,
+  pinPrivateStateDirectory,
+  readPrivateFile,
+  type PrivateFileIdentity,
+  type PrivateStateDirectory,
+  type PrivateStateHooks,
+} from './private-task-state.js';
 
 const MAX_LEDGER_BYTES = 4 * 1024 * 1024;
 const FEISHU_DEDUPE_WINDOW_MS = 60 * 60 * 1000;
@@ -46,14 +52,23 @@ export interface DeliveryStoreRequest {
 export async function executeTaskCardDelivery(
   ledgerPath: string,
   request: DeliveryStoreRequest,
+  options: {
+    guard?: PrivateStateDirectory;
+    privateStateHooks?: PrivateStateHooks;
+  } = {},
 ): Promise<TaskCardDeliveryStatus> {
   if (!isAbsolute(ledgerPath) || !OPAQUE_ID.test(request.deliveryId)
-    || !/^[a-f0-9]{64}$/.test(request.inputHash) || !Number.isFinite(Date.parse(request.now))) {
+    || !/^[a-f0-9]{64}$/.test(request.inputHash) || !isCanonicalInstant(request.now)) {
     throw new TaskCardDeliveryError('ERR_TASK_CARD_INPUT');
   }
+  const ownedGuard = options.guard ? undefined : await pinPrivateStateDirectory(dirname(ledgerPath))
+    .catch(() => { throw new TaskCardDeliveryError('ERR_TASK_CARD_STATE'); });
+  const guard = options.guard ?? ownedGuard!;
   const key = hash(`${request.kind}\0${request.deliveryId}`);
-  return withFileLock(ledgerPath, async () => {
-    const state = (await readLedger(ledgerPath, true)) ?? emptyLedger();
+  try { return await withFileLock(ledgerPath, async () => {
+    await revalidate(guard);
+    const loaded = await readLedger(ledgerPath, true, guard, options.privateStateHooks);
+    const state = loaded?.state ?? emptyLedger();
     const existingValue = Object.prototype.hasOwnProperty.call(state.deliveries, key)
       ? state.deliveries[key] : undefined;
     let record: DeliveryRecord;
@@ -65,6 +80,7 @@ export async function executeTaskCardDelivery(
       }
       if (record.state === 'sent') {
         await request.afterSend(record.messageId!);
+        await revalidate(guard);
         return 'duplicate';
       }
       if (Date.parse(request.now) - Date.parse(record.attemptedAt) >= FEISHU_DEDUPE_WINDOW_MS) {
@@ -75,42 +91,68 @@ export async function executeTaskCardDelivery(
         kind: request.kind,
         deliveryId: request.deliveryId,
         inputHash: request.inputHash,
-        uuid: `tc_${hash(`${request.kind}\0${request.deliveryId}`).slice(0, 43)}`,
+        uuid: stableUuid(request.kind, request.deliveryId),
         state: 'attempting',
         attemptedAt: request.now,
       };
       setOwn(state.deliveries, key, record);
-      await writeLedger(ledgerPath, state);
+      await writeLedger(
+        ledgerPath, state, guard, options.privateStateHooks, loaded?.identity ?? null,
+      );
+      await revalidate(guard);
     }
 
     let messageId: string;
+    await revalidate(guard);
     try { messageId = await request.send(record.uuid); } catch {
+      await revalidate(guard);
       throw new TaskCardDeliveryError('ERR_TASK_CARD_SEND');
     }
+    await revalidate(guard);
     if (!OPAQUE_ID.test(messageId)) throw new TaskCardDeliveryError('ERR_TASK_CARD_SEND');
     await request.afterSend(messageId);
+    await revalidate(guard);
     setOwn(state.deliveries, key, { ...record, state: 'sent', messageId });
-    await writeLedger(ledgerPath, state);
+    const latest = await readLedger(ledgerPath, false, guard, options.privateStateHooks);
+    await writeLedger(ledgerPath, state, guard, options.privateStateHooks, latest.identity);
+    await revalidate(guard);
     return 'sent';
-  });
+  }); } finally {
+    await ownedGuard?.close().catch(() => { throw new TaskCardDeliveryError('ERR_TASK_CARD_STATE'); });
+  }
 }
 
 function emptyLedger(): LedgerState {
   return { schemaVersion: 1, deliveries: Object.create(null) as Record<string, unknown> };
 }
 
-async function readLedger(path: string, allowMissing: boolean): Promise<LedgerState | undefined> {
-  let info;
-  try { info = await lstat(path); } catch (error: any) {
-    if (error?.code === 'ENOENT' && allowMissing) return undefined;
-    throw new TaskCardDeliveryError('ERR_TASK_CARD_STATE');
-  }
-  if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.()
-    || (info.mode & 0o777) !== 0o600 || info.size > MAX_LEDGER_BYTES) {
-    throw new TaskCardDeliveryError('ERR_TASK_CARD_STATE');
-  }
+interface LoadedLedger {
+  state: LedgerState;
+  identity: PrivateFileIdentity;
+}
+
+async function readLedger(
+  path: string,
+  allowMissing: true,
+  guard: PrivateStateDirectory,
+  hooks?: PrivateStateHooks,
+): Promise<LoadedLedger | undefined>;
+async function readLedger(
+  path: string,
+  allowMissing: false,
+  guard: PrivateStateDirectory,
+  hooks?: PrivateStateHooks,
+): Promise<LoadedLedger>;
+async function readLedger(
+  path: string,
+  allowMissing: boolean,
+  guard: PrivateStateDirectory,
+  hooks: PrivateStateHooks = {},
+): Promise<LoadedLedger | undefined> {
   try {
-    const value = JSON.parse(await readFile(path, 'utf8')) as unknown;
+    const snapshot = await readPrivateFile(path, MAX_LEDGER_BYTES, allowMissing, guard, hooks);
+    if (!snapshot) return undefined;
+    const value = JSON.parse(snapshot.raw) as unknown;
     if (!isRecord(value) || !exactKeys(value, ['schemaVersion', 'deliveries'])
       || value.schemaVersion !== 1 || !isRecord(value.deliveries)) throw new Error('invalid');
     const deliveries = Object.create(null) as Record<string, unknown>;
@@ -120,7 +162,10 @@ async function readLedger(path: string, allowMissing: boolean): Promise<LedgerSt
       if (hash(`${record.kind}\0${record.deliveryId}`) !== key) throw new Error('invalid');
       setOwn(deliveries, key, record);
     }
-    return { schemaVersion: 1, deliveries };
+    return {
+      state: { schemaVersion: 1, deliveries },
+      identity: { device: snapshot.device, inode: snapshot.inode },
+    };
   } catch (error) {
     if (error instanceof TaskCardDeliveryError) throw error;
     throw new TaskCardDeliveryError('ERR_TASK_CARD_STATE');
@@ -134,8 +179,9 @@ function parseDelivery(value: unknown): DeliveryRecord {
     || typeof value.deliveryId !== 'string' || !OPAQUE_ID.test(value.deliveryId)
     || typeof value.inputHash !== 'string' || !/^[a-f0-9]{64}$/.test(value.inputHash)
     || typeof value.uuid !== 'string' || value.uuid.length > 50 || !OPAQUE_ID.test(value.uuid)
+    || value.uuid !== stableUuid(value.kind as TaskCardKind, value.deliveryId as string)
     || (value.state !== 'attempting' && value.state !== 'sent')
-    || typeof value.attemptedAt !== 'string' || !Number.isFinite(Date.parse(value.attemptedAt))
+    || !isCanonicalInstant(value.attemptedAt)
     || (value.state === 'sent' && (typeof value.messageId !== 'string' || !OPAQUE_ID.test(value.messageId)))
     || (value.state === 'attempting' && value.messageId !== undefined)) {
     throw new TaskCardDeliveryError('ERR_TASK_CARD_STATE');
@@ -143,10 +189,30 @@ function parseDelivery(value: unknown): DeliveryRecord {
   return value as unknown as DeliveryRecord;
 }
 
-async function writeLedger(path: string, state: LedgerState): Promise<void> {
-  try { await atomicWriteFile(path, `${JSON.stringify(state)}\n`, { mode: 0o600 }); } catch {
+async function writeLedger(
+  path: string,
+  state: LedgerState,
+  guard: PrivateStateDirectory,
+  hooks: PrivateStateHooks | undefined,
+  expected: PrivateFileIdentity | null,
+): Promise<void> {
+  try { await durablePrivateWrite(path, `${JSON.stringify(state)}\n`, guard, hooks, expected); } catch {
     throw new TaskCardDeliveryError('ERR_TASK_CARD_STATE');
   }
+}
+
+function stableUuid(kind: TaskCardKind, deliveryId: string): string {
+  return `tc_${hash(`${kind}\0${deliveryId}`).slice(0, 43)}`;
+}
+
+function isCanonicalInstant(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) && date.toISOString() === value;
+}
+
+async function revalidate(guard: PrivateStateDirectory): Promise<void> {
+  try { await guard.revalidate(); } catch { throw new TaskCardDeliveryError('ERR_TASK_CARD_STATE'); }
 }
 
 function hash(value: string): string {

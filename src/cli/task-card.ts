@@ -1,6 +1,4 @@
-import { constants } from 'node:fs';
-import { lstat, open, realpath } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, resolve } from 'node:path';
 
 import {
   deliverTaskCard,
@@ -8,6 +6,11 @@ import {
   type TaskCardDeliveryDeps,
   type TaskCardKind,
 } from '../services/task-card-delivery.js';
+import {
+  pinPrivateStateDirectory,
+  readPrivateFile,
+  type PrivateStateDirectory,
+} from '../services/private-task-state.js';
 
 const MAX_INPUT_BYTES = 256 * 1024;
 
@@ -33,57 +36,47 @@ export async function runTaskCardCommand(
       || !isKind(args[1])) return failure('ERR_TASK_CARD_USAGE');
     const stateDir = deps.stateDir ?? process.env.BOTMUX_TASK_OS_STATE_DIR;
     if (!stateDir) return failure('ERR_TASK_CARD_STATE');
-    await validatePrivateDirectory(stateDir);
-    const input = await readPrivateInput(stateDir, args[3]);
-    let parsed: unknown;
-    try { parsed = JSON.parse(input); } catch { return failure('ERR_TASK_CARD_INPUT'); }
-    validateTaskCardEnvelope(args[1], parsed);
-    const deliver = deps.deliver ?? deliverTaskCard;
-    const result = await deliver(stateDir, args[1], parsed);
-    return {
-      code: 0,
-      stdout: `${JSON.stringify({ success: true, kind: args[1], status: result.status })}\n`,
-      stderr: '',
-    };
+    let guard: PrivateStateDirectory;
+    try { guard = await pinPrivateStateDirectory(stateDir); } catch {
+      return failure('ERR_TASK_CARD_STATE');
+    }
+    try {
+      const input = await readPrivateInput(stateDir, args[3], guard);
+      let parsed: unknown;
+      try { parsed = JSON.parse(input); } catch { return failure('ERR_TASK_CARD_INPUT'); }
+      validateTaskCardEnvelope(args[1], parsed);
+      const deliver = deps.deliver ?? deliverTaskCard;
+      const result = await deliver(stateDir, args[1], parsed);
+      await guard.revalidate();
+      return {
+        code: 0,
+        stdout: `${JSON.stringify({ success: true, kind: args[1], status: result.status })}\n`,
+        stderr: '',
+      };
+    } finally {
+      await guard.close().catch(() => { throw new Error('ERR_TASK_CARD_STATE'); });
+    }
   } catch (error) {
     const code = stableCode(error);
     return failure(code);
   }
 }
 
-async function validatePrivateDirectory(path: string): Promise<void> {
-  if (!isCanonicalAbsolute(path)) throw new Error('ERR_TASK_CARD_STATE');
-  try {
-    const info = await lstat(path);
-    if (!info.isDirectory() || info.isSymbolicLink() || !ownedByCurrentUser(info.uid)
-      || (info.mode & 0o777) !== 0o700) {
-      throw new Error('invalid');
-    }
-  } catch { throw new Error('ERR_TASK_CARD_STATE'); }
-}
-
-async function readPrivateInput(stateDir: string, inputPath: string): Promise<string> {
+async function readPrivateInput(
+  stateDir: string,
+  inputPath: string,
+  guard: PrivateStateDirectory,
+): Promise<string> {
   if (!isCanonicalAbsolute(inputPath) || dirname(inputPath) !== stateDir) {
     throw new Error('ERR_TASK_CARD_INPUT_FILE');
   }
-  let before;
-  try { before = await lstat(inputPath); } catch { throw new Error('ERR_TASK_CARD_INPUT_FILE'); }
-  if (!before.isFile() || before.isSymbolicLink() || !ownedByCurrentUser(before.uid)
-    || (before.mode & 0o777) !== 0o600 || before.size > MAX_INPUT_BYTES
-    || await realpath(inputPath) !== join(await realpath(stateDir), basename(inputPath))) {
-    throw new Error('ERR_TASK_CARD_INPUT_FILE');
-  }
-  let handle;
   try {
-    handle = await open(inputPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-    const after = await handle.stat();
-    if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino
-      || !ownedByCurrentUser(after.uid) || (after.mode & 0o777) !== 0o600
-      || after.size > MAX_INPUT_BYTES) throw new Error('invalid');
-    return await handle.readFile('utf8');
-  } catch { throw new Error('ERR_TASK_CARD_INPUT_FILE'); } finally {
-    try { await handle?.close(); } catch { /* best effort */ }
-  }
+    await guard.revalidate();
+    const snapshot = await readPrivateFile(inputPath, MAX_INPUT_BYTES, false, guard);
+    await guard.revalidate();
+    if (!snapshot) throw new Error('missing');
+    return snapshot.raw;
+  } catch { throw new Error('ERR_TASK_CARD_INPUT_FILE'); }
 }
 
 function stableCode(error: unknown): string {
@@ -101,9 +94,4 @@ function isKind(value: string): value is TaskCardKind {
 
 function isCanonicalAbsolute(path: string): boolean {
   return typeof path === 'string' && isAbsolute(path) && resolve(path) === path;
-}
-
-function ownedByCurrentUser(uid: number): boolean {
-  const current = process.getuid?.();
-  return current === undefined || uid === current;
 }

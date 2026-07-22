@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
-import { lstat } from 'node:fs/promises';
-import { isAbsolute, join } from 'node:path';
+import { join } from 'node:path';
 
 import {
   buildMrAttentionCard,
@@ -18,6 +17,11 @@ import {
   type TaskCardKind,
 } from './task-card-delivery-store.js';
 import type { TaskCandidateRecord } from './task-action-dispatch.js';
+import {
+  pinPrivateStateDirectory,
+  type PrivateStateDirectory,
+  type PrivateStateHooks,
+} from './private-task-state.js';
 
 export type { TaskCardKind } from './task-card-delivery-store.js';
 
@@ -40,6 +44,7 @@ export interface TaskCardDeliveryDeps {
   sendMessage?: (
     larkAppId: string, chatId: string, content: string, msgType: string, uuid: string,
   ) => Promise<string>;
+  privateStateHooks?: PrivateStateHooks;
 }
 
 export async function deliverTaskCard(
@@ -48,46 +53,64 @@ export async function deliverTaskCard(
   input: unknown,
   deps: TaskCardDeliveryDeps = {},
 ): Promise<{ status: TaskCardDeliveryStatus }> {
-  await validateStateDir(stateDir);
-  let envelope: ValidEnvelope;
-  try { envelope = parseEnvelope(kind, input); } catch (error) {
-    if (error instanceof TaskCardDeliveryError) throw error;
-    throw new TaskCardDeliveryError('ERR_TASK_CARD_INPUT');
+  let guard: PrivateStateDirectory;
+  try { guard = await pinPrivateStateDirectory(stateDir); } catch {
+    throw new TaskCardDeliveryError('ERR_TASK_CARD_STATE');
   }
-
-  const registry = createTaskCandidateRegistry(join(stateDir, 'task-candidates.json'));
-  if (envelope.candidate) {
-    try { await registry.persist(envelope.candidate); } catch (error) {
-      if (String((error as Error)?.message).includes('conflict')) {
-        throw new TaskCardDeliveryError('ERR_TASK_CARD_CONFLICT');
-      }
-      throw new TaskCardDeliveryError('ERR_TASK_CARD_STATE');
+  try {
+    let envelope: ValidEnvelope;
+    try { envelope = parseEnvelope(kind, input); } catch (error) {
+      if (error instanceof TaskCardDeliveryError) throw error;
+      throw new TaskCardDeliveryError('ERR_TASK_CARD_INPUT');
     }
-  }
 
-  const register = deps.registerBot ?? defaultRegisterBot;
-  try { await register(envelope.larkAppId); } catch {
-    throw new TaskCardDeliveryError('ERR_TASK_CARD_SEND');
-  }
-  const send = deps.sendMessage ?? defaultSendMessage;
-  const inputHash = createHash('sha256').update(JSON.stringify(envelope.canonical)).digest('hex');
-  const status = await executeTaskCardDelivery(join(stateDir, 'task-card-deliveries.json'), {
-    kind,
-    deliveryId: envelope.deliveryId,
-    inputHash,
-    now: deps.now?.() ?? new Date().toISOString(),
-    send: (uuid) => send(envelope.larkAppId, envelope.chatId, envelope.cardContent, 'interactive', uuid),
-    afterSend: async (messageId) => {
-      if (!envelope.candidate) return;
-      try { await registry.bindRootMessage(envelope.candidate.candidateId, messageId); } catch (error) {
+    const registry = createTaskCandidateRegistry(join(stateDir, 'task-candidates.json'), {
+      privateStateHooks: deps.privateStateHooks,
+    });
+    if (envelope.candidate) {
+      try { await registry.persist(envelope.candidate); } catch (error) {
         if (String((error as Error)?.message).includes('conflict')) {
           throw new TaskCardDeliveryError('ERR_TASK_CARD_CONFLICT');
         }
         throw new TaskCardDeliveryError('ERR_TASK_CARD_STATE');
       }
-    },
-  });
-  return { status };
+      await revalidateStateDir(guard);
+    }
+
+    const register = deps.registerBot ?? defaultRegisterBot;
+    try { await register(envelope.larkAppId); } catch {
+      await revalidateStateDir(guard);
+      throw new TaskCardDeliveryError('ERR_TASK_CARD_SEND');
+    }
+    await revalidateStateDir(guard);
+    const send = deps.sendMessage ?? defaultSendMessage;
+    const inputHash = createHash('sha256').update(JSON.stringify(envelope.canonical)).digest('hex');
+    const status = await executeTaskCardDelivery(join(stateDir, 'task-card-deliveries.json'), {
+      kind,
+      deliveryId: envelope.deliveryId,
+      inputHash,
+      now: deps.now?.() ?? new Date().toISOString(),
+      send: (uuid) => send(
+        envelope.larkAppId, envelope.chatId, envelope.cardContent, 'interactive', uuid,
+      ),
+      afterSend: async (messageId) => {
+        if (!envelope.candidate) return;
+        try { await registry.bindRootMessage(envelope.candidate.candidateId, messageId); } catch (error) {
+          if (String((error as Error)?.message).includes('conflict')) {
+            throw new TaskCardDeliveryError('ERR_TASK_CARD_CONFLICT');
+          }
+          throw new TaskCardDeliveryError('ERR_TASK_CARD_STATE');
+        }
+      },
+    }, {
+      guard,
+      privateStateHooks: deps.privateStateHooks,
+    });
+    await revalidateStateDir(guard);
+    return { status };
+  } finally {
+    await guard.close().catch(() => { throw new TaskCardDeliveryError('ERR_TASK_CARD_STATE'); });
+  }
 }
 
 /** Validate the exact, kind-specific envelope without performing any side effect. */
@@ -163,13 +186,8 @@ function exactCard(value: Record<string, unknown>, keys: readonly string[]): Rec
   return Object.fromEntries(keys.map((key) => [key, value[key]]));
 }
 
-async function validateStateDir(stateDir: string): Promise<void> {
-  if (!isAbsolute(stateDir)) throw new TaskCardDeliveryError('ERR_TASK_CARD_STATE');
-  try {
-    const info = await lstat(stateDir);
-    if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid?.()
-      || (info.mode & 0o777) !== 0o700) throw new Error('invalid');
-  } catch { throw new TaskCardDeliveryError('ERR_TASK_CARD_STATE'); }
+async function revalidateStateDir(guard: PrivateStateDirectory): Promise<void> {
+  try { await guard.revalidate(); } catch { throw new TaskCardDeliveryError('ERR_TASK_CARD_STATE'); }
 }
 
 async function defaultRegisterBot(larkAppId: string): Promise<void> {

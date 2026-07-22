@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readFileSync, statSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -8,7 +8,7 @@ import { createTaskCandidateRegistry } from '../src/services/task-candidate-regi
 const roots: string[] = [];
 
 function fixture() {
-  const root = mkdtempSync(join(tmpdir(), 'botmux-task-registry-'));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-task-registry-')));
   chmodSync(root, 0o700);
   roots.push(root);
   const path = join(root, 'task-candidates.json');

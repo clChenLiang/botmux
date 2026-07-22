@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -7,7 +7,7 @@ import { runTaskCardCommand } from '../src/cli/task-card.js';
 
 const roots: string[] = [];
 function fixture(mode = 0o600) {
-  const root = mkdtempSync(join(tmpdir(), 'botmux-task-card-cli-'));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-task-card-cli-')));
   chmodSync(root, 0o700);
   roots.push(root);
   const input = join(root, 'candidate.json');

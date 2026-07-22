@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, statSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, renameSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -8,7 +8,7 @@ import { createTaskCandidateRegistry } from '../src/services/task-candidate-regi
 
 const roots: string[] = [];
 function stateDir() {
-  const root = mkdtempSync(join(tmpdir(), 'botmux-task-card-'));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-task-card-')));
   chmodSync(root, 0o700);
   roots.push(root);
   return root;
@@ -113,5 +113,89 @@ describe('task card delivery', () => {
     expect(bodies[1]).toContain('task_ignore_repository');
     await expect(deliverTaskCard(root, 'completion', { ...completion, card: { ...completion.card, title: 'Changed' } }, deps))
       .rejects.toThrow(/ERR_TASK_CARD_CONFLICT/);
+  });
+
+  it('revalidates the pinned state directory before send and does not send after retarget', async () => {
+    const root = stateDir();
+    const moved = `${root}-moved`;
+    roots.push(moved);
+    let sends = 0;
+    await expect(deliverTaskCard(root, 'candidate', candidateEnvelope(), {
+      registerBot: async () => {
+        renameSync(root, moved);
+        mkdirSync(root, { mode: 0o700 });
+      },
+      sendMessage: async () => { sends += 1; return 'om_forbidden'; },
+    })).rejects.toThrow(/ERR_TASK_CARD_STATE/);
+    expect(sends).toBe(0);
+  });
+
+  it.each(['file-fsync', 'directory-fsync'] as const)(
+    'does not send when durable candidate persistence fails at %s', async (failAt) => {
+    const root = stateDir();
+    let sends = 0;
+    await expect(deliverTaskCard(root, 'candidate', candidateEnvelope(), {
+      privateStateHooks: { failAt },
+      registerBot: async () => {},
+      sendMessage: async () => { sends += 1; return 'om_forbidden'; },
+    })).rejects.toThrow(/ERR_TASK_CARD_STATE/);
+    expect(sends).toBe(0);
+  });
+
+  it('does not send an MR when durable ledger directory fsync fails', async () => {
+    const root = stateDir();
+    let sends = 0;
+    const mr = {
+      schemaVersion: 1, deliveryId: 'mr-fsync', larkAppId: 'cli_task_bot', chatId: 'oc_tasks',
+      card: { mrId: 'mr_opaque', repositoryId: 'repo_opaque', title: 'MR attention',
+        summary: 'Checks failed', repositoryLabel: 'marketplace' },
+    };
+    await expect(deliverTaskCard(root, 'mr', mr, {
+      privateStateHooks: { failAt: 'directory-fsync' },
+      registerBot: async () => {},
+      sendMessage: async () => { sends += 1; return 'om_forbidden'; },
+    })).rejects.toThrow(/ERR_TASK_CARD_STATE/);
+    expect(sends).toBe(0);
+  });
+
+  it('fails closed when the state directory is retargeted during send', async () => {
+    const root = stateDir();
+    const moved = `${root}-after-send`;
+    roots.push(moved);
+    let sends = 0;
+    await expect(deliverTaskCard(root, 'candidate', candidateEnvelope(), {
+      registerBot: async () => {},
+      sendMessage: async () => {
+        sends += 1;
+        renameSync(root, moved);
+        mkdirSync(root, { mode: 0o700 });
+        return 'om_ambiguous';
+      },
+    })).rejects.toThrow(/ERR_TASK_CARD_STATE/);
+    expect(sends).toBe(1);
+  });
+
+  it.each([
+    ['uuid', 'tc_tampered'],
+    ['attemptedAt', '2026-07-22 00:00:00Z'],
+  ])('rejects a ledger with tampered %s', async (field, value) => {
+    const root = stateDir();
+    const deps = {
+      now: () => '2026-07-22T00:00:00.000Z',
+      registerBot: async () => {},
+      sendMessage: async () => { throw new Error('leave attempting'); },
+    };
+    await expect(deliverTaskCard(root, 'candidate', candidateEnvelope(), deps))
+      .rejects.toThrow(/ERR_TASK_CARD_SEND/);
+    const path = join(root, 'task-card-deliveries.json');
+    const state = JSON.parse(await import('node:fs/promises').then(({ readFile }) => readFile(path, 'utf8')));
+    const key = Object.keys(state.deliveries)[0];
+    state.deliveries[key][field] = value;
+    const { writeFile, chmod } = await import('node:fs/promises');
+    await writeFile(path, JSON.stringify(state), { mode: 0o600 });
+    await chmod(path, 0o600);
+    await expect(deliverTaskCard(root, 'candidate', candidateEnvelope(), {
+      ...deps, sendMessage: async () => 'om_should_not_send',
+    })).rejects.toThrow(/ERR_TASK_CARD_STATE/);
   });
 });
